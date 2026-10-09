@@ -83,6 +83,9 @@ static void test_reasoning_budget(
             }
         }
 
+        const llama_token forced = common_reasoning_budget_get_forced_token(sampler);
+        GGML_ASSERT(forced == (finite_count == 1 ? finite_token : LLAMA_TOKEN_NULL));
+
         llama_sampler_accept(sampler, sequence[i]);
 
         fprintf(stderr, "    i=%zu: token=%d, finite_count=%zu, finite_token=%d\n", i, (int)sequence[i], finite_count, (int)finite_token);
@@ -148,6 +151,7 @@ static llama_token get_forced_token(struct llama_sampler * sampler, llama_token 
     }
 
     GGML_ASSERT(finite_count == 1 && "sampler is not forcing exactly one token");
+    GGML_ASSERT(common_reasoning_budget_get_forced_token(sampler) == finite_token);
     return finite_token;
 }
 
