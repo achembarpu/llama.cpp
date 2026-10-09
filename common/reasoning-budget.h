@@ -43,6 +43,9 @@ struct llama_sampler * common_reasoning_budget_init(
 
 common_reasoning_budget_state common_reasoning_budget_get_state(const struct llama_sampler * smpl);
 
+// Next mandatory token while forcing, or LLAMA_TOKEN_NULL otherwise.
+llama_token common_reasoning_budget_get_forced_token(const struct llama_sampler * smpl);
+
 // The end sequence that transitioned the sampler to DONE, or nullptr if none
 // was recorded. Cleared when a new start sequence re-arms the sampler.
 const llama_tokens * common_reasoning_budget_get_end_match(const struct llama_sampler * smpl);

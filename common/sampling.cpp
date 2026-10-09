@@ -425,12 +425,6 @@ struct common_sampler * common_sampler_init(
         params.backend_sampling = false;
     }
 
-    if (rbudget && params.backend_sampling) {
-        LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
-
-        params.backend_sampling = false;
-    }
-
     auto * result = new common_sampler {
         /* .params  = */ params,
         /* .grmr    = */ grmr,
@@ -627,7 +621,14 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
 
             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
-            GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
+
+            const llama_token forced = common_reasoning_budget_get_forced_token(rbudget);
+            if (forced != LLAMA_TOKEN_NULL) {
+                // Expose the budget's one-hot distribution to speculative rejection too.
+                gsmpl->cur = {{forced, 0.0f, 1.0f}};
+                cur_p = {gsmpl->cur.data(), gsmpl->cur.size(), 0, true};
+                return forced;
+            }
 
             for (size_t i = 0; i < cur_p.size; ++i) {
                 if (cur_p.data[i].id == id) {
