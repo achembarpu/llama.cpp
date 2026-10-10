@@ -1475,11 +1475,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
-        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
-
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+
+        // A shared-KV drafter has no prompt catch-up pass. Only output positions
+        // are needed for the initial draft and for accepting verification rows.
+        llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ is_mem_shared);
+        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
@@ -1629,12 +1631,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
-            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            std::vector<int32_t> target_rows;
+            for (int32_t k = i_batch_beg[seq_id]; k <= i_batch_end[seq_id]; ++k) {
+                if (!is_mem_shared || (batch_in.tokens[k].seq_id == seq_id && batch_in.tokens[k].output)) {
+                    target_rows.push_back(k);
+                }
+            }
+            const int32_t n_rows = target_rows.size();
             verify_h_rows[seq_id] = n_rows;
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
+            if (n_rows == 0) {
+                continue;
+            }
 
             for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, target_rows[i]);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 

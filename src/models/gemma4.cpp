@@ -169,7 +169,9 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     // TODO: is causal == true correct? might need some changes
     auto * inp_attn = build_attn_inp_kv_iswa();
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    const bool skip_final_output = n_outputs == 0 && !cparams.training &&
+            (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
+    ggml_tensor * inp_out_ids = skip_final_output ? nullptr : build_inp_out_ids();
 
     ggml_tensor * inp_per_layer = nullptr;
     if (model.per_layer_tok_embd) {
@@ -181,6 +183,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     }
 
     for (int il = 0; il < n_layer; ++il) {
+        const bool kv_only = il == n_layer - 1 && skip_final_output;
         const int64_t n_embd_head = hparams.n_embd_head_k(il);
         GGML_ASSERT(n_embd_head == hparams.n_embd_head_v(il));
 
@@ -264,16 +267,18 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
             cur = build_attn(inp_attn, model.layers[il].wo,
                     nullptr, model.layers[il].wo_s, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
-                    hparams.f_attention_scale, il);
+                    hparams.f_attention_scale, il, kv_only);
         } else {
             // reuse KV cache of earlier layers
             cur = build_attn(inp_attn,
                     model.layers[il].wo, nullptr, model.layers[il].wo_s,
-                    Qcur, nullptr, nullptr, nullptr, nullptr, nullptr, hparams.f_attention_scale, il);
+                    Qcur, nullptr, nullptr, nullptr, nullptr, nullptr, hparams.f_attention_scale, il, kv_only);
         }
 
-        // TODO @ngxson : strip unused token right after the last KV layer to speed up prompt processing
-        // keep all rows when extracting unmasked nextn embeddings (MTP target needs the hidden state for every token)
+        if (kv_only) {
+            // Only cache writes survive a batch with no requested output rows.
+            return;
+        }
         if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
             cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
             inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
