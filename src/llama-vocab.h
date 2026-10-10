@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <utility>
 
 // pre-tokenization types
 enum llama_vocab_pre_type {
@@ -160,7 +161,7 @@ struct llama_vocab {
 
     int max_token_len() const;
 
-    int find_bpe_rank(const std::string & token_left, const std::string & token_right) const;
+    int find_bpe_rank(const std::pair<std::string, std::string> & tokens) const;
     std::vector<std::string> get_bpe_merges() const;
 
     std::vector<char> get_precompiled_charsmap() const;
