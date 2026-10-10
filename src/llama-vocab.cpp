@@ -20,6 +20,7 @@
 #include <map>
 #include <queue>
 #include <set>
+#include <tuple>
 #include <unordered_map>
 
 //
@@ -735,11 +736,9 @@ struct llm_tokenizer_bpe_session {
             }
         }
 
-        symbols = symbols_final;
-
-        if (!symbols.empty()) {
-            for (int i = 0; i != -1; i = symbols[i].next) {
-                auto & symbol = symbols[i];
+        if (!symbols_final.empty()) {
+            for (int i = 0; i != -1; i = symbols_final[i].next) {
+                auto & symbol = symbols_final[i];
                 if (symbol.n == 0) {
                     continue;
                 }
@@ -776,12 +775,12 @@ private:
         if (left == -1 || right == -1) {
             return;
         }
-        std::string left_token  = std::string(symbols[left].text,  symbols[left].n);
-        std::string right_token = std::string(symbols[right].text, symbols[right].n);
-
-        int rank_found = -1;
-
-        rank_found = vocab.find_bpe_rank(left_token, right_token);
+        // Construct the map key in place; moving short strings still copies their inline buffers.
+        const std::pair<std::string, std::string> tokens(
+            std::piecewise_construct,
+            std::forward_as_tuple(symbols[left].text, symbols[left].n),
+            std::forward_as_tuple(symbols[right].text, symbols[right].n));
+        const int rank_found = vocab.find_bpe_rank(tokens);
 
         if (rank_found < 0) {
             return;
@@ -791,7 +790,7 @@ private:
 
         bigram.left  = left;
         bigram.right = right;
-        bigram.size  = left_token.size() + right_token.size();
+        bigram.size  = symbols[left].n + symbols[right].n;
         bigram.rank  = rank_found;
 
         work_queue.push(bigram);
@@ -4341,11 +4340,11 @@ int llama_vocab::max_token_len() const {
     return pimpl->max_token_len;
 }
 
-int llama_vocab::find_bpe_rank(const std::string & token_left, const std::string & token_right) const {
-    GGML_ASSERT(token_left.find(' ')   == std::string::npos);
-    GGML_ASSERT(token_right.find(' ')  == std::string::npos);
+int llama_vocab::find_bpe_rank(const std::pair<std::string, std::string> & tokens) const {
+    GGML_ASSERT(tokens.first.find(' ')  == std::string::npos);
+    GGML_ASSERT(tokens.second.find(' ') == std::string::npos);
 
-    auto it = pimpl->bpe_ranks.find(std::make_pair(token_left, token_right));
+    auto it = pimpl->bpe_ranks.find(tokens);
     if (it == pimpl->bpe_ranks.end()) {
         return -1;
     }
