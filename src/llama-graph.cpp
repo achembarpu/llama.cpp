@@ -3402,7 +3402,9 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * sinks,
         ggml_tensor * v_mla,
             float     kq_scale,
-            int       il) const {
+            int       il,
+            bool      kv_only) const {
+    GGML_ASSERT(!kv_only || !cparams.training);
     const bool is_swa = hparams.is_swa(il);
 
     auto * k_rot = is_swa ? inp->self_k_rot_swa : inp->self_k_rot;
@@ -3422,7 +3424,9 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
-    ggml_build_forward_expand(gf, q_cur);
+    if (!kv_only) {
+        ggml_build_forward_expand(gf, q_cur);
+    }
 
     if (k_cur) {
         ggml_build_forward_expand(gf, k_cur);
@@ -3455,6 +3459,10 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & v_idxs = is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs();
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+    }
+
+    if (kv_only) {
+        return nullptr;
     }
 
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
