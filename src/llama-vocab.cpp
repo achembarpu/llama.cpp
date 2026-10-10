@@ -272,7 +272,6 @@ struct llm_bigram_bpe {
     using queue = llama_priority_queue<llm_bigram_bpe, queue_storage, comparator>;
     llm_symbol::index left;
     llm_symbol::index right;
-    std::string text;
     int rank;
     size_t size;
 };
@@ -703,9 +702,8 @@ struct llm_tokenizer_bpe_session {
                 if (left_symbol.n == 0 || right_symbol.n == 0) {
                     continue;
                 }
-                std::string left_token = std::string(left_symbol.text, left_symbol.n);
-                std::string right_token = std::string(right_symbol.text, right_symbol.n);
-                if (left_token + right_token != bigram.text) {
+                // Live symbols only grow; a changed length makes this queued pair stale.
+                if (left_symbol.n + right_symbol.n != bigram.size) {
                     continue;  // Skip this bigram if it's outdated
                 }
 
@@ -793,7 +791,6 @@ private:
 
         bigram.left  = left;
         bigram.right = right;
-        bigram.text  = left_token + right_token;
         bigram.size  = left_token.size() + right_token.size();
         bigram.rank  = rank_found;
 
