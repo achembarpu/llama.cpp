@@ -714,6 +714,52 @@ struct case_state_restore_fragmented : ctx_test {
 
         TLOG_INF("%s: restored seq 1 continued identically to the reference, nmse %g\n", __func__, diff.nmse());
 
+        llama_memory_t mem = llama_get_memory(ctx.get());
+        llama_memory_clear(mem, true);
+        CTX_REQUIRE(set_seq_state(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE, state_before), "owner remap failed");
+        CTX_REQUIRE(llama_memory_seq_pos_max(mem, 0) == n_tokens - 1, "owner position changed on remap");
+        CTX_REQUIRE(llama_memory_seq_pos_min(mem, 1) == -1, "foreign reservation became a live sequence");
+        CTX_REQUIRE(llama_memory_seq_pos_max(mem, 2) == -1, "foreign reservation exposed a position");
+
+        // Partial checkpoints carry SWA state; pure KV partial restores do not rewind positions.
+        if (llama_model_n_swa(mr.model) > 0) {
+            std::vector<uint8_t> partial;
+            const auto partial_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+            CTX_REQUIRE(get_seq_state(ctx.get(), 0, partial_flags, partial), "partial capture failed");
+            CTX_REQUIRE(decode_one(ctx.get(), mr.tokens[0], n_tokens, 0), "partial continuation failed");
+            CTX_REQUIRE(set_seq_state(ctx.get(), 0, partial_flags, partial), "partial restore failed");
+            CTX_REQUIRE(llama_memory_seq_pos_max(mem, 0) == n_tokens - 1, "partial rollback lost the owner");
+            CTX_REQUIRE(llama_memory_seq_pos_max(mem, 1) == -1, "partial rollback activated a reservation");
+        }
+
+        CTX_REQUIRE(decode_one(ctx.get(), mr.tokens[0], 0, 2), "peer activation failed");
+        CTX_REQUIRE(llama_memory_seq_pos_min(mem, 2) == 0, "peer inherited a reserved position");
+        CTX_REQUIRE(llama_memory_seq_pos_max(mem, 2) == 0, "peer inherited reserved history");
+        CTX_REQUIRE(llama_memory_seq_pos_max(mem, 1) == -1, "peer activated another reservation");
+        CTX_REQUIRE(llama_memory_seq_pos_max(mem, 0) == n_tokens - 1, "peer activation changed the owner");
+
+        llama_memory_clear(mem, true);
+        CTX_REQUIRE(set_seq_state(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE, state_before), "owner restore failed");
+        CTX_REQUIRE(llama_memory_seq_rm(mem, 0, -1, -1), "owner removal failed");
+        for (llama_seq_id s = 0; s < 3; ++s) {
+            CTX_REQUIRE(llama_memory_seq_pos_max(mem, s) == -1, "owner removal left a reservation");
+        }
+
+        const uint8_t layout_magic[] = {'K', 'V', 'L', '2'};
+        auto corrupt = state_before;
+        const auto marker = std::search(corrupt.begin(), corrupt.end(), std::begin(layout_magic), std::end(layout_magic));
+        CTX_REQUIRE(marker != corrupt.end(), "allocator metadata missing");
+        const size_t offset = marker - corrupt.begin();
+        const size_t foreign_count_offset = offset + 3*sizeof(uint32_t) + size_t(n_tokens)*sizeof(uint32_t) + sizeof(llama_seq_id);
+        CTX_REQUIRE(foreign_count_offset + sizeof(uint32_t) <= corrupt.size(), "allocator metadata truncated");
+        const uint32_t invalid_count = UINT32_MAX;
+        memcpy(corrupt.data() + foreign_count_offset, &invalid_count, sizeof(invalid_count));
+        CTX_REQUIRE(llama_state_seq_set_data(ctx.get(), corrupt.data(), corrupt.size(), 0) == 0, "malformed reservations accepted");
+        for (llama_seq_id s = 0; s < 3; ++s) {
+            CTX_REQUIRE(llama_memory_seq_pos_max(mem, s) == -1, "failed restore left reservations");
+        }
+        CTX_REQUIRE(set_seq_state(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE, state_before), "restore after malformed state failed");
+
         return case_result::pass();
     }
 };

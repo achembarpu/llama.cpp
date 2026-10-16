@@ -37,7 +37,13 @@ class llama_kv_cells {
 public:
     using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
 
+    // These memberships reserve allocator geometry, without owning usable K/V.
+    llama_seq_id reservation_owner = -1;
+    seq_set_t reservation_seqs;
+
     void reset() {
+        reservation_owner = -1;
+        reservation_seqs.reset();
         for (uint32_t i = 0; i < pos.size(); ++i) {
             pos[i]   = -1;
             ext[i].reset();

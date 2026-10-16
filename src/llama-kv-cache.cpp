@@ -402,6 +402,29 @@ void llama_kv_cache::clear(bool data) {
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (!other && (seq_id == -1 || (p0 <= 0 && p1 < 0))) {
+        release_reservations();
+    }
+    return seq_rm_impl(seq_id, p0, p1);
+}
+
+void llama_kv_cache::release_reservations() {
+    if (other) {
+        other->release_reservations();
+        return;
+    }
+    for (auto & cells : v_cells) {
+        for (llama_seq_id s = 0; s < (int) n_seq_max; ++s) {
+            if (cells.reservation_seqs.test(s)) {
+                seq_rm_impl(s, -1, -1);
+            }
+        }
+        cells.reservation_seqs.reset();
+        cells.reservation_owner = -1;
+    }
+}
+
+bool llama_kv_cache::seq_rm_impl(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
@@ -475,6 +498,8 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     if (other) {
         return;
     }
+
+    release_reservations();
 
     GGML_ASSERT(seq_id_src >= 0 && (size_t) seq_id_src < seq_to_stream.size());
     GGML_ASSERT(seq_id_dst >= 0 && (size_t) seq_id_dst < seq_to_stream.size());
@@ -568,6 +593,8 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
         return;
     }
 
+    release_reservations();
+
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
@@ -594,6 +621,8 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     if (other) {
         return;
     }
+
+    release_reservations();
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
@@ -645,6 +674,8 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
         return;
     }
 
+    release_reservations();
+
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_div() is only supported for n_pos_per_embd() == 1");
 
@@ -688,7 +719,7 @@ llama_pos llama_kv_cache::seq_pos_min(llama_seq_id seq_id) const {
 
     const auto & cells = v_cells[seq_to_stream[seq_id]];
 
-    return cells.seq_pos_min(seq_id);
+    return cells.reservation_seqs.test(seq_id) ? -1 : cells.seq_pos_min(seq_id);
 }
 
 llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
@@ -701,7 +732,7 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
 
     const auto & cells = v_cells[seq_to_stream[seq_id]];
 
-    return cells.seq_pos_max(seq_id);
+    return cells.reservation_seqs.test(seq_id) ? -1 : cells.seq_pos_max(seq_id);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
@@ -770,6 +801,17 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
     llama_kv_cache::slot_info_vec_t res;
+
+    // Hybrid/SWA wrappers also enter here, bypassing init_batch().
+    for (const auto & ubatch : ubatches) {
+        for (uint32_t i = 0; i < ubatch.n_seqs_unq; ++i) {
+            const auto seq = ubatch.seq_id_unq[i];
+            const auto & cells = v_cells[seq_to_stream[seq]];
+            if (cells.reservation_owner >= 0 && cells.reservation_owner != seq) {
+                release_reservations();
+            }
+        }
+    }
 
     struct state_t {
         slot_info sinfo; // slot info for the ubatch
@@ -1195,7 +1237,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             LLAMA_LOG_DEBUG("%s: purging positions [%d, %d] of sequence %d from KV cache\n",
                     __func__, cells.seq_pos_min(s), seq_pos_max_rm[s], s);
 
-            seq_rm(s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1);
+            seq_rm_impl(s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1);
         }
     }
 
@@ -2098,6 +2140,8 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
             add_cell = add_cell && !cells.is_empty(i);
             add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
+            add_cell = add_cell && (seq_id == -1 ? (cells.seq_get_all(i) & ~cells.reservation_seqs).any() :
+                                                   !cells.reservation_seqs.test(seq_id));
 
             // A full state must preserve the live sequence's rewindable SWA rows.
             // Compact only partial checkpoints; dropping assigned rows here can
@@ -2143,7 +2187,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         // allocation head. Partial checkpoints and whole-context states keep
         // their existing encoding and placement behavior.
         if (seq_id >= 0 && !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
-            const uint32_t magic = 0x314c564b; // KVL1
+            const uint32_t magic = 0x324c564b; // KVL2
             const uint32_t capacity = cells.size();
             io.write(&magic, sizeof(magic));
             io.write(&capacity, sizeof(capacity));
@@ -2151,6 +2195,25 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
             for (const auto & range : cr.data) {
                 for (uint32_t i = range.first; i < range.second; ++i) {
                     io.write(&i, sizeof(i));
+                }
+            }
+            io.write(&seq_id, sizeof(seq_id));
+            uint32_t foreign_count = 0;
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                foreign_count += (cells.seq_get_all(i).count() > size_t(cells.seq_has(i, seq_id)));
+            }
+            io.write(&foreign_count, sizeof(foreign_count));
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                const uint32_t count = cells.seq_get_all(i).count() - size_t(cells.seq_has(i, seq_id));
+                if (!count) { continue; }
+                const llama_pos pos = cells.pos_get(i);
+                io.write(&i, sizeof(i));
+                io.write(&pos, sizeof(pos));
+                io.write(&count, sizeof(count));
+                for (llama_seq_id id = 0; id < (int) n_seq_max; ++id) {
+                    if (id != seq_id && cells.seq_has(i, id)) {
+                        io.write(&id, sizeof(id));
+                    }
                 }
             }
         }
@@ -2200,6 +2263,8 @@ const slot_info_vec_t *   sinfos_in) {
     // clear() resets all streams at once, so doing it per stream below would keep only the last one
     if (seq_id == -1) {
         clear(true);
+    } else if (!(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+        release_reservations();
     }
 
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -2218,6 +2283,12 @@ const slot_info_vec_t *   sinfos_in) {
 
         slot_info sinfo;
         slot_info saved_layout;
+        struct foreign_cell {
+            uint32_t idx;
+            llama_pos pos;
+            llama_kv_cells::seq_set_t seqs;
+        };
+        std::vector<foreign_cell> foreign;
         uint32_t saved_head = 0;
         const bool keep_layout = seq_id >= 0 && !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         const slot_info * layout = sinfos_in ? &(*sinfos_in)[s] : nullptr;
@@ -2227,7 +2298,7 @@ const slot_info_vec_t *   sinfos_in) {
             io.read(&magic, sizeof(magic));
             io.read(&capacity, sizeof(capacity));
             io.read(&saved_head, sizeof(saved_head));
-            if (magic != 0x314c564b || capacity != v_cells[strm].size() || cell_count > capacity || saved_head > capacity) {
+            if (magic != 0x324c564b || capacity != v_cells[strm].size() || cell_count > capacity || saved_head > capacity) {
                 throw std::runtime_error("invalid or incompatible sequence KV layout");
             }
             saved_layout.s0 = strm;
@@ -2247,6 +2318,40 @@ const slot_info_vec_t *   sinfos_in) {
                 throw std::runtime_error("sequence KV layout differs from its mirrored cache");
             }
             layout = &saved_layout;
+            llama_seq_id saved_owner;
+            uint32_t foreign_count;
+            io.read(&saved_owner, sizeof(saved_owner));
+            io.read(&foreign_count, sizeof(foreign_count));
+            if (saved_owner < 0 || saved_owner >= (int) n_seq_max || foreign_count > capacity) {
+                throw std::runtime_error("invalid sequence KV allocator metadata");
+            }
+            seen.assign(capacity, false);
+            foreign.reserve(foreign_count);
+            for (uint32_t i = 0; i < foreign_count; ++i) {
+                foreign_cell cell{};
+                uint32_t count;
+                io.read(&cell.idx, sizeof(cell.idx));
+                io.read(&cell.pos, sizeof(cell.pos));
+                io.read(&count, sizeof(count));
+                if (cell.idx >= capacity || seen[cell.idx] || cell.pos < 0 || count == 0 || count >= n_seq_max) {
+                    throw std::runtime_error("invalid foreign KV cell");
+                }
+                seen[cell.idx] = true;
+                for (uint32_t j = 0; j < count; ++j) {
+                    llama_seq_id id;
+                    io.read(&id, sizeof(id));
+                    if (id < 0 || id >= (int) n_seq_max || id == saved_owner) {
+                        throw std::runtime_error("invalid foreign KV membership");
+                    }
+                    // Renaming the owner swaps IDs, retaining a one-to-one mapping.
+                    id = id == seq_id ? saved_owner : id;
+                    if (cell.seqs.test(id)) {
+                        throw std::runtime_error("duplicate foreign KV membership");
+                    }
+                    cell.seqs.set(id);
+                }
+                foreign.push_back(cell);
+            }
         }
 
         bool res = true;
@@ -2254,6 +2359,40 @@ const slot_info_vec_t *   sinfos_in) {
 
         try {
             res = res && state_read_data(io, strm, cell_count, sinfo);
+            if (res && keep_layout) {
+                auto & cells = v_cells[strm];
+                llama_kv_cells::seq_set_t reserved;
+                for (const auto & cell : foreign) {
+                    if (!cells.is_empty(cell.idx) && cells.pos_get(cell.idx) != cell.pos) {
+                        throw std::runtime_error("foreign KV position conflicts with live state");
+                    }
+                    const auto live = cells.seq_get_all(cell.idx);
+                    auto allowed = cell.seqs;
+                    allowed.set(seq_id);
+                    if ((live & ~allowed).any()) {
+                        throw std::runtime_error("foreign KV membership conflicts with live state");
+                    }
+                    for (llama_seq_id id = 0; id < (int) n_seq_max; ++id) {
+                        if (cell.seqs.test(id) && !live.test(id)) {
+                            if (cells.seq_pos_max(id) >= 0) {
+                                throw std::runtime_error("foreign KV sequence is already live");
+                            }
+                            reserved.set(id);
+                        }
+                    }
+                }
+                // Validate the complete footprint before installing any reservation.
+                cells.reservation_owner = seq_id;
+                cells.reservation_seqs = reserved;
+                for (const auto & cell : foreign) {
+                    if (cells.is_empty(cell.idx)) { cells.pos_set(cell.idx, cell.pos); }
+                    for (llama_seq_id id = 0; id < (int) n_seq_max; ++id) {
+                        if (cell.seqs.test(id) && !cells.seq_has(cell.idx, id)) {
+                            cells.seq_add(cell.idx, id);
+                        }
+                    }
+                }
+            }
         } catch (...) {
             res = false;
         }
@@ -2281,7 +2420,7 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
 
             for (llama_seq_id cur = 0; cur < (int) n_seq_max; ++cur) {
                 if (cur == seq_id || seq_id == -1) {
-                    if (cells.seq_has(i, cur)) {
+                    if (cells.seq_has(i, cur) && !cells.reservation_seqs.test(cur)) {
                         seq_ids.push_back(cur);
                     }
                 }
@@ -2417,7 +2556,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             return false;
         }
 
-        seq_rm(dest_seq_id, -1, -1);
+        seq_rm_impl(dest_seq_id, -1, -1);
 
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
 
