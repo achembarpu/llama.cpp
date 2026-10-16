@@ -378,13 +378,11 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 break; // process new tasks
             } else {
                 // wait for new tasks or timeout for checking sleeping condition
-                bool res = condition_tasks.wait_for(lock, max_wait_time, [&]{
+                condition_tasks.wait_for(lock, max_wait_time, [&]{
                     return (!queue_tasks.empty() || !running);
                 });
-                if (res) {
-                    break; // new task arrived or terminate
-                }
-                // otherwise, loop again to check sleeping condition
+                // Also give the model executor a bounded idle maintenance tick.
+                break;
             }
         }
     }

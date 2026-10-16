@@ -277,6 +277,8 @@ struct server_slot {
 
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
+    int64_t t_last_snapshot = -1;
+    bool snapshot_eligible = false;
 
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
@@ -323,6 +325,14 @@ struct server_slot {
 
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
         if (cur == nullptr) {
+            if (prompt_cache.disk && task_prev && task_prev->params.cache_prompt) {
+                for (const auto & entry : prompt_cache.states) {
+                    if (entry->prompt.tokens.size() == prompt.tokens.size() &&
+                        size_t(entry->prompt.tokens.get_common_prefix(prompt.tokens)) == prompt.tokens.size()) {
+                        return prompt_cache.persist(*entry);
+                    }
+                }
+            }
             return false;
         }
 
@@ -331,8 +341,8 @@ struct server_slot {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
 
-        if (task_prev && task_prev->params.cache_prompt && task_prev->params.lora.empty()) {
-            prompt_cache.persist(*cur);
+        if (task_prev && task_prev->params.cache_prompt && task_prev->params.lora.empty() && prompt_cache.disk) {
+            return prompt_cache.persist(*cur);
         }
 
         return true;
@@ -597,6 +607,7 @@ struct server_slot {
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
             t_last_used = ggml_time_us();
+            snapshot_eligible = stop != STOP_TYPE_NONE && !truncated && !task->is_child();
 
             state = SLOT_STATE_IDLE;
 
@@ -1521,11 +1532,10 @@ private:
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
             if (!params_base.cache_ssd_path.empty()) {
-                // The physical-layout format is qualified only for one text
-                // slot, without adapters. Other profiles retain RAM caching.
-                if (params_base.n_parallel != 1 || !params_base.lora_adapters.empty() ||
+                if (!params_base.ctx_admission || !params_base.kv_unified || params_base.ctx_shift ||
+                    !params_base.lora_adapters.empty() || mctx ||
                     (ctx_dft && llama_get_ctx_other(ctx_dft) != ctx_tgt)) {
-                    SRV_WRN("%s", "SSD cache disabled: requires one slot, no adapters and shared-KV/no separate draft context\n");
+                    SRV_WRN("%s", "SSD cache disabled: requires admitted unified text KV, no shift/adapters and shared-KV/no separate draft context\n");
                 } else {
                     try {
                         server_cache_disk_config config;
@@ -1533,7 +1543,8 @@ private:
                         config.identity = params_base.cache_ssd_identity;
                         config.max_tokens = n_ctx;
                         config.max_state_bytes = prompt_cache->limit_size ? prompt_cache->limit_size : (16ull << 30);
-                        prompt_cache->disk = std::make_unique<server_cache_disk>(std::move(config));
+                        config.worker_cpu = params_base.cache_ssd_cpu;
+                        prompt_cache->disk = std::make_unique<server_cache_async>(std::move(config), [this]() { queue_tasks.retry_deferred(); });
                     } catch (const std::exception & e) {
                         SRV_WRN("SSD cache disabled: %s\n", e.what());
                     }
@@ -1742,6 +1753,7 @@ private:
     }
 
     void reject_task_tree(const server_task & task, const std::string & message, error_type type) {
+        if (prompt_cache && prompt_cache->disk) { prompt_cache->disk->cancel(task.id); }
         send_error(task, message, type);
         for (const auto & child : task.child_tasks) { reject_task_tree(child, message, type); }
     }
@@ -1753,7 +1765,7 @@ private:
         }
     }
 
-    server_slot * get_available_slot(const server_task & task) {
+    server_slot * get_available_slot(server_task & task) {
         server_slot * ret = nullptr;
 
         bool update_cache = false;
@@ -1833,6 +1845,39 @@ private:
                 SLT_INF(*ret, "selected slot by LRU, n_tokens = %d, t_last = %" PRId64 "\n", ret->prompt.n_tokens(), ret->t_last_used);
 
                 update_cache = true;
+            }
+        }
+
+        if (ret && prompt_cache && prompt_cache->disk && task.params.cache_prompt) {
+            const size_t live = ret->prompt.tokens.get_common_prefix(task.tokens);
+            // Reprocessing one prompt batch is cheaper than decoding a multi-GiB
+            // record, and must not queue behind a background save.
+            if (live >= 8192 && task.tokens.size() - live <= llama_n_batch(ctx_tgt)) { task.cache_checked = true; }
+            bool restore = prompt_cache->best_prefix(task.tokens, live) > live;
+            const bool busy = std::any_of(slots.begin(), slots.end(), [](const auto & slot) { return slot.is_processing(); });
+            if (!task.cache_checked && task.tokens.size() >= 8192) {
+                const auto phase = prompt_cache->disk->poll(task.id, task.tokens, prompt_cache->best_prefix(task.tokens, live));
+                if (phase == server_cache_async::status::memory) {
+                    if (prompt_cache->clear_unpinned()) { prompt_cache->disk->grant_memory(task.id); }
+                    return nullptr;
+                }
+                if (phase == server_cache_async::status::pending) { return nullptr; }
+                if (phase == server_cache_async::status::ready && busy) { return nullptr; }
+                auto state = prompt_cache->disk->take(task.id);
+                if (state) { prompt_cache->states.push_back(std::move(state)); restore = true; }
+                task.cache_checked = true;
+            }
+            if (restore) {
+                // Restoring exact physical rows/head is a GPU transaction. Wait
+                // rather than overwrite a running sequence or silently prefill.
+                if (busy) { return nullptr; }
+                for (auto & state : prompt_cache->states) { if (state.use_count() != 1) { return nullptr; } }
+                for (auto & slot : slots) {
+                    if (&slot != ret && !slot.prompt.tokens.empty()) {
+                        slot.prompt_clear();
+                    }
+                }
+                ret->prompt_clear();
             }
         }
 
@@ -2997,6 +3042,7 @@ private:
                 } break;
             case SERVER_TASK_TYPE_CANCEL:
                 {
+                    if (prompt_cache && prompt_cache->disk) { prompt_cache->disk->cancel(task.id_target); }
                     // release slot linked with the task id
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {
@@ -3385,6 +3431,18 @@ private:
                 SRV_TRC("%s", "all slots are idle\n");
 
                 metrics_flush_idle();
+
+                if (prompt_cache && prompt_cache->disk && !prompt_cache->disk->memory_reserved()) {
+                    for (auto & slot : slots) {
+                        if (slot.t_last_snapshot != slot.t_last_used && slot.t_last_used > 0 &&
+                            ggml_time_us() - slot.t_last_used >= 5000000 &&
+                            slot.task_prev && slot.task_prev->params.cache_prompt &&
+                            slot.snapshot_eligible && slot.prompt.tokens.size() >= 8192) {
+                            if (slot.prompt_save(*prompt_cache)) { slot.t_last_snapshot = slot.t_last_used; }
+                            prompt_cache->update();
+                        }
+                    }
+                }
 
                 return; // skip further processing
 

@@ -21,6 +21,29 @@ struct server_cache_disk_config {
     size_t max_tokens = 131072;
     uint64_t max_state_bytes = 16ull << 30;
     std::function<int64_t()> clock;
+    std::function<void()> checkpoint; // bounded I/O/codec cancellation point
+    int worker_cpu = -1;
+};
+
+// One I/O owner, one immutable save in flight and one coalesced pending save.
+// Restores get priority over pending saves. Only the model executor may grant
+// memory or apply the decoded state; this worker never accesses a llama context.
+class server_cache_async {
+public:
+    enum class status { pending, memory, miss, ready };
+    explicit server_cache_async(server_cache_disk_config config, std::function<void()> wake);
+    ~server_cache_async();
+    bool save(std::shared_ptr<const server_prompt_cache_state> state);
+    status poll(int task, const server_tokens & tokens, size_t min_lcp);
+    void grant_memory(int task);
+    std::shared_ptr<server_prompt_cache_state> take(int task);
+    void cancel(int task);
+    void reject(const std::string & name);
+    bool memory_reserved() const;
+    void interrupt();
+private:
+    struct impl;
+    std::unique_ptr<impl> p;
 };
 
 class server_cache_disk {
@@ -32,6 +55,7 @@ public:
 
     void save(const server_prompt_cache_state & state);
     void reject_last_load();
+    void reject(const std::string & name);
     // Load only if the disk prefix beats both live and RAM prefixes. No GPU state
     // is touched until the complete record and checksum have been validated.
     bool load(server_prompt_cache_state & state, const server_tokens & tokens, size_t min_lcp,

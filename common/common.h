@@ -646,6 +646,7 @@ struct common_params {
     int32_t queue_timeout = 120; // seconds from posting, including deferred time
     std::string cache_ssd_path;
     std::string cache_ssd_identity;
+    int32_t cache_ssd_cpu = -1;
 
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
