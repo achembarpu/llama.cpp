@@ -2563,6 +2563,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         ).set_env("LLAMA_ARG_N_PARALLEL"));
     }
     add_opt(common_arg(
+        {"--ctx-admission"},
+        "reserve prompt + generation tokens in the unified KV pool; bound the waiting queue",
+        [](common_params & params) { params.ctx_admission = true; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--queue-limit"}, "N",
+        "maximum deferred requests with --ctx-admission (default: 8)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 1024) { throw std::invalid_argument("queue-limit must be in [0, 1024]"); }
+            params.queue_limit = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--queue-timeout"}, "SECONDS",
+        "maximum waiting time with --ctx-admission (default: 120)",
+        [](common_params & params, int value) {
+            if (value < 1 || value > 3600) { throw std::invalid_argument("queue-timeout must be in [1, 3600]"); }
+            params.queue_timeout = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-ns", "--sequences"}, "N",
         string_format("number of sequences to decode (default: %d)", params.n_sequences),
         [](common_params & params, int value) {
