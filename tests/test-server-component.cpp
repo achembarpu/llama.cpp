@@ -2,7 +2,10 @@
 
 #include "../tools/server/server-common.h"
 #include "../tools/server/server-decision.h"
+#include "../tools/server/server-queue.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <regex>
 #include <string>
@@ -435,6 +438,35 @@ static void test_decision_escape(testing & t) {
     });
 }
 
+static void test_response_wait(testing & t) {
+    server_response responses;
+    responses.add_waiting_task_id(1);
+    responses.add_waiting_task_id(2);
+    std::atomic<bool> stop{false};
+    std::thread unrelated([&]() {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (!stop && std::chrono::steady_clock::now() < until) {
+            auto result = std::make_unique<server_task_result_error>();
+            result->id = 2;
+            responses.send(std::move(result));
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    });
+
+    const auto start = std::chrono::steady_clock::now();
+    auto result = responses.recv_with_timeout({1}, 1);
+    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    stop = true;
+    unrelated.join();
+    t.assert_true("unrelated responses are not returned", !result);
+    t.assert_true("other clients do not extend polling deadline", elapsed < 2.5);
+
+    auto ready = std::make_unique<server_task_result_error>();
+    ready->id = 1;
+    responses.send(std::move(ready));
+    t.assert_true("target response is still returned", responses.recv_with_timeout({1}, 0) != nullptr);
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -453,6 +485,7 @@ int main(int argc, char ** argv) {
     t.test("json_helpers",  test_json_helpers);
     t.test("lora_helpers",  test_lora_helpers);
     t.test("server_pipe",   test_server_pipe);
+    t.test("response_wait", test_response_wait);
     t.test("decision_escape", test_decision_escape);
 
     return t.summary();
