@@ -2783,6 +2783,34 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
     return true;
 }
 
+static bool ggml_cuda_should_fuse_rms_norm_set_rows(
+        const ggml_tensor * rms_norm, const ggml_tensor * view, const ggml_tensor * set_rows) {
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * indices = set_rows->src[1];
+    if (x->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32 ||
+            (set_rows->type != GGML_TYPE_F16 && set_rows->type != GGML_TYPE_F32)) {
+        return false;
+    }
+    // One cache row per token, with flattened contiguous head dimensions.
+    // Wider/higher-dimensional/strided-index cases retain the ordinary path.
+    if (x->ne[0] < 1 || x->ne[0] > 1024 || x->ne[1] < 1 || x->ne[1] > INT32_MAX ||
+            x->ne[2] < 1 || x->ne[2] > UINT16_MAX || x->ne[3] != 1 || x->nb[0] != sizeof(float) ||
+            x->nb[1] % sizeof(float) != 0 || x->nb[2] % sizeof(float) != 0 ||
+            !ggml_is_contiguous(rms_norm) || !ggml_is_contiguous(view) || view->view_offs != 0 ||
+            view->ne[0] != x->ne[0]*x->ne[1] || view->ne[1] != x->ne[2] ||
+            view->ne[2] != 1 || view->ne[3] != 1 ||
+            set_rows->ne[0] != view->ne[0] || set_rows->ne[2] != 1 || set_rows->ne[3] != 1 ||
+            set_rows->nb[0] != ggml_type_size(set_rows->type) ||
+            set_rows->nb[1] < set_rows->ne[0]*ggml_type_size(set_rows->type) ||
+            set_rows->nb[1] % ggml_type_size(set_rows->type) != 0 ||
+            indices->type != GGML_TYPE_I64 || !ggml_is_contiguous(indices) ||
+            indices->ne[0] != x->ne[2] || indices->ne[1] != 1 ||
+            indices->ne[2] != 1 || indices->ne[3] != 1) {
+        return false;
+    }
+    return true;
+}
+
 static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm,
                                                     const ggml_tensor * mul,
                                                     const ggml_tensor * rope) {
@@ -3263,6 +3291,45 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 }
 
 
+
+static bool ggml_cuda_should_fuse_rms_mul_add_scalar(const ggml_cgraph * graph, int i) {
+    if (i + 3 >= graph->n_nodes) { return false; }
+    const ggml_tensor * rms = graph->nodes[i];
+    const ggml_tensor * mul = graph->nodes[i + 1];
+    const ggml_tensor * add = graph->nodes[i + 2];
+    const ggml_tensor * last = graph->nodes[i + 3];
+    if (!ggml_can_fuse_subgraph(graph, i,
+            { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL }, { i + 3 }) ||
+            mul->src[0] != rms || add->src[0] != mul || last->src[0] != add) { return false; }
+    const ggml_tensor * x = rms->src[0];
+    const ggml_tensor * weights = mul->src[1];
+    const ggml_tensor * residual = add->src[1];
+    const ggml_tensor * scalar = last->src[1];
+    // Preserve even allocator-reused intermediate storage; native Gemma places
+    // the final scalar output in the same buffer as the residual ADD.
+    if (last->data != add->data) { return false; }
+    if (x->ne[0] != 3840 || x->ne[1] < 1 || x->ne[1] > UINT16_MAX ||
+            x->ne[2] != 1 || x->ne[3] != 1 || !weights || !residual || !scalar ||
+            weights->ne[0] != 3840 || ggml_nelements(weights) != 3840 || ggml_nelements(scalar) != 1) { return false; }
+    for (const ggml_tensor * t : { x, rms, mul, add, last, residual }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || !ggml_are_same_shape(t, x) || !t->data) { return false; }
+    }
+    for (const ggml_tensor * t : { weights, scalar }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || !t->data) { return false; }
+    }
+    const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const uintptr_t pa = reinterpret_cast<uintptr_t>(a->data), pb = reinterpret_cast<uintptr_t>(b->data);
+        return pa <= pb ? pb - pa < ggml_nbytes(a) : pa - pb < ggml_nbytes(b);
+    };
+    // Full same-shape aliases are safe: each row finishes its reduction before
+    // pointwise stores. Shifted input aliases and shared weights/scalars refuse.
+    for (const ggml_tensor * t : { x, residual }) {
+        if (overlaps(last, t) && last->data != t->data) { return false; }
+    }
+    if (overlaps(last, weights) || overlaps(last, scalar)) { return false; }
+    return true;
+}
+
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
@@ -3307,6 +3374,15 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             int out_nodes[] = { node_idx + 2 };
             return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
         }
+    }
+
+    std::initializer_list<enum ggml_op> rms_norm_set_rows_ops = { GGML_OP_RMS_NORM, GGML_OP_VIEW, GGML_OP_SET_ROWS };
+    if (is_equal(rms_norm_set_rows_ops, ops) &&
+            ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 }) &&
+            ggml_check_edges(cgraph, node_idx, {{1, 0, 0}, {2, 0, 1}}) &&
+            ggml_cuda_should_fuse_rms_norm_set_rows(cgraph->nodes[node_idx], cgraph->nodes[node_idx + 1], cgraph->nodes[node_idx + 2])) {
+        int out_nodes[] = { node_idx + 2 };
+        return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
     }
 
     std::initializer_list<enum ggml_op> rms_norm_mul_rope_ops          = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE };
@@ -4254,6 +4330,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    if (node->op == GGML_OP_RMS_NORM &&
+            ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
+        ggml_cuda_op_rms_norm_set_rows_fused(*cuda_ctx, node, cgraph->nodes[i + 2]);
+        return 2;
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
         return 4;
@@ -4262,6 +4344,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr);
         return 2;
+    }
+
+    if (node->op == GGML_OP_RMS_NORM && node->src[0]->ne[0] == 3840 &&
+            ggml_cuda_should_fuse_rms_mul_add_scalar(cgraph, i)) {
+        ggml_cuda_op_rms_norm_mul_add_scalar_fused(*cuda_ctx, node,
+            cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3]);
+        return 3;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
