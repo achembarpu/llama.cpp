@@ -9,8 +9,15 @@
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
-#if defined(__linux__) && defined(CPPHTTPLIB_OPENSSL_SUPPORT)
+struct server_cache_interrupted : std::runtime_error { using std::runtime_error::runtime_error; };
+
+#if defined(__linux__) && defined(CPPHTTPLIB_OPENSSL_SUPPORT) && defined(LLAMA_SERVER_CACHE_ZSTD)
+#include <zstd.h>
 #include <openssl/evp.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -18,13 +25,14 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
+#include <sched.h>
 
 namespace {
 constexpr uint64_t metadata_reserve = 65536;
 constexpr size_t max_header = 2 * 1024 * 1024;
 constexpr size_t max_entries = 64;
 constexpr size_t max_checkpoints = 32;
-constexpr uint32_t magic = 0x31445348; // HSD1; little endian, private format
+constexpr uint32_t magic = 0x32445348; // HSD2; one Zstd frame, private format
 
 struct fd_owner {
     int fd;
@@ -42,6 +50,8 @@ struct fd_owner {
 void require(bool ok, const char * reason) {
     if (!ok) { throw std::runtime_error(reason); }
 }
+
+void zcheck(size_t result) { require(!ZSTD_isError(result), ZSTD_getErrorName(result)); }
 
 struct digest_sha256 {
     std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx{EVP_MD_CTX_new(), EVP_MD_CTX_free};
@@ -175,7 +185,7 @@ struct server_cache_disk::impl {
         std::string bytes(pre[1], '\0');
         transfer(fd, &bytes[0], bytes.size(), false, hash);
         const json h = json::parse(bytes);
-        require(h.at("version") == 1 && h.at("identity") == c.identity &&
+        require(h.at("version") == 2 && h.at("codec") == "zstd-fast1-long29" && h.at("identity") == c.identity &&
             h.at("seq_version") == LLAMA_STATE_SEQ_VERSION, "incompatible identity or version");
         const auto & tokens = h.at("tokens");
         require(tokens.is_array() && tokens.size() >= c.min_tokens && tokens.size() <= c.max_tokens, "invalid token count");
@@ -191,7 +201,8 @@ struct server_cache_disk::impl {
             require(n <= c.max_state_bytes - total, "state exceeds RAM bound");
             total += n;
         }
-        require(sizes.at(0).get<uint64_t>() > 0 && file_size == sizeof(pre) + bytes.size() + total + 32, "invalid file size");
+        require(sizes.at(0).get<uint64_t>() > 0 && file_size > sizeof(pre) + bytes.size() + 32 &&
+            file_size <= sizeof(pre) + bytes.size() + ZSTD_compressBound(total) + 32, "invalid file size");
         const int64_t created = h.at("created").get<int64_t>();
         require(created > 0 && created <= now() && created > now() - c.ttl_seconds, "expired or future record");
         for (const auto & ck : ckpts) {
@@ -204,6 +215,7 @@ struct server_cache_disk::impl {
     }
 
     explicit impl(server_cache_disk_config config) : c(std::move(config)) {
+        require(ZSTD_versionNumber() == 10507, "SSD cache requires pinned Zstd 1.5.7");
         require(hex_id(c.identity), "cache SSD identity must be a lowercase SHA256 manifest digest");
         require(c.max_bytes > metadata_reserve && c.ttl_seconds > 0 && c.min_tokens > 0 &&
             c.max_tokens >= c.min_tokens && c.max_state_bytes > 0, "invalid SSD bounds");
@@ -289,15 +301,19 @@ struct server_cache_disk::impl {
                 if (size_t(e.tokens.get_common_prefix(state.prompt.tokens)) == state.prompt.tokens.size()) { return; }
             }
             const auto t = now();
-            json h = {{"version", 1}, {"seq_version", LLAMA_STATE_SEQ_VERSION}, {"identity", c.identity},
-                {"created", t}, {"tokens", state.prompt.tokens.get_text_tokens()}, {"sizes", json::array()}, {"checkpoints", json::array()}};
+            const int64_t captured = state.captured_at > 0 ? state.captured_at : t;
+            require(captured <= t && captured > t - c.ttl_seconds, "capture expired or in future");
+            json h = {{"version", 2}, {"codec", "zstd-fast1-long29"}, {"seq_version", LLAMA_STATE_SEQ_VERSION}, {"identity", c.identity},
+                {"created", captured}, {"tokens", state.prompt.tokens.get_text_tokens()}, {"sizes", json::array()}, {"checkpoints", json::array()}};
             for (const auto & b : buffers(state)) { h["sizes"].push_back(b->size()); }
             for (const auto & ck : state.prompt.checkpoints) {
                 h["checkpoints"].push_back({{"n", ck.n_tokens}, {"task", ck.id_task}, {"min", ck.pos_min}, {"max", ck.pos_max}});
             }
             const std::string header = h.dump();
             require(header.size() <= max_header, "header too large");
-            const uint64_t bytes = 8 + header.size() + state.size() + 32;
+            // Reserve the incompressible bound before writing. Settle to actual
+            // bytes only after publication; interrupted attempts stay charged.
+            const uint64_t bound = 8 + header.size() + ZSTD_compressBound(state.size()) + 32;
             json recent = json::array();
             uint64_t spent = 0;
             for (const auto & w : reservations) {
@@ -308,23 +324,44 @@ struct server_cache_disk::impl {
                 }
             }
             reservations = std::move(recent);
-            require(bytes <= c.write_bytes - spent && reservations.size() < 256, "rolling-day write cap");
+            require(bound <= c.write_bytes - spent && reservations.size() < 256, "rolling-day write cap");
             // Reserve durably before attempting data writes, including failures
             // or crashes. Restart and clock rollback cannot reset the budget.
-            reservations.push_back(json::array({t, bytes}));
+            reservations.push_back(json::array({t, bound}));
             ledger();
-            make_room(bytes);
+            make_room(bound);
             fd_owner out(openat(dir, ".entry.tmp", O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
             require(out.fd >= 0, "entry temporary file failed");
             digest_sha256 sha;
             uint32_t pre[2] = {magic, uint32_t(header.size())};
             transfer(out.fd, pre, sizeof(pre), true, &sha);
             transfer(out.fd, const_cast<char *>(header.data()), header.size(), true, &sha);
-            for (const auto * b : buffers(state)) {
-                transfer(out.fd, const_cast<uint8_t *>(b->data()), b->size(), true, &sha);
+            std::unique_ptr<ZSTD_CCtx, decltype(&ZSTD_freeCCtx)> codec(ZSTD_createCCtx(), ZSTD_freeCCtx);
+            require(bool(codec), "compression allocation failed");
+            zcheck(ZSTD_CCtx_setParameter(codec.get(), ZSTD_c_compressionLevel, -1));
+            zcheck(ZSTD_CCtx_setParameter(codec.get(), ZSTD_c_enableLongDistanceMatching, 1));
+            zcheck(ZSTD_CCtx_setParameter(codec.get(), ZSTD_c_windowLog, 29));
+            zcheck(ZSTD_CCtx_setParameter(codec.get(), ZSTD_c_nbWorkers, 0));
+            zcheck(ZSTD_CCtx_setPledgedSrcSize(codec.get(), state.size()));
+            std::vector<uint8_t> chunk(1024 * 1024);
+            const auto sources = buffers(state);
+            for (size_t i = 0; i < sources.size(); ++i) {
+                ZSTD_inBuffer input{sources[i]->data(), sources[i]->size(), 0};
+                const auto mode = i + 1 == sources.size() ? ZSTD_e_end : ZSTD_e_continue;
+                size_t remaining;
+                do {
+                    if (c.checkpoint) { c.checkpoint(); }
+                    ZSTD_outBuffer output{chunk.data(), chunk.size(), 0};
+                    remaining = ZSTD_compressStream2(codec.get(), &output, &input, mode);
+                    zcheck(remaining);
+                    transfer(out.fd, chunk.data(), output.pos, true, &sha);
+                } while (input.pos < input.size || (mode == ZSTD_e_end && remaining));
             }
             std::array<uint8_t, 32> digest{}; sha.final(digest.data());
             transfer(out.fd, digest.data(), digest.size(), true);
+            const auto end = lseek(out.fd, 0, SEEK_CUR);
+            require(end > 0 && uint64_t(end) <= bound, "compressed size exceeds reservation");
+            const uint64_t bytes = end;
             struct timespec times[2] = {{t, 0}, {0, UTIME_OMIT}};
             require(futimens(out.fd, times) == 0, "initial LRU timestamp failed");
             require(fsync(out.fd) == 0, "entry sync failed");
@@ -332,6 +369,8 @@ struct server_cache_disk::impl {
             require(renameat(dir, ".entry.tmp", dir, name.c_str()) == 0, "entry rename failed");
             published = true;
             sync_dir();
+            reservations.back().at(1) = bytes;
+            ledger();
             entries.push_back({name, std::move(h), state.prompt.tokens.clone(), bytes, t});
             // Only retire a shorter prefix after its replacement is durable.
             for (auto it = entries.begin(); it != std::prev(entries.end());) {
@@ -370,6 +409,8 @@ struct server_cache_disk::impl {
             if (before_allocate) { before_allocate(); }
             server_prompt_cache_state result;
             result.prompt.tokens = best->tokens.clone();
+            result.disk_name = best->name;
+            result.captured_at = h.at("created").get<int64_t>();
             for (const auto & ck : h.at("checkpoints")) {
                 common_prompt_checkpoint cp{};
                 cp.n_tokens = ck.at("n").get<int64_t>();
@@ -383,8 +424,38 @@ struct server_cache_disk::impl {
             for (const auto * cb : buffers(result)) {
                 auto * b = const_cast<std::vector<uint8_t> *>(cb);
                 b->resize(h.at("sizes").at(i++).get<size_t>());
-                transfer(in.fd, b->data(), b->size(), false, &sha);
             }
+            std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> codec(ZSTD_createDCtx(), ZSTD_freeDCtx);
+            require(bool(codec), "decompression allocation failed");
+            zcheck(ZSTD_DCtx_setParameter(codec.get(), ZSTD_d_windowLogMax, 29));
+            const auto destinations = buffers(result);
+            std::vector<uint8_t> chunk(1024 * 1024);
+            const auto payload_offset = lseek(in.fd, 0, SEEK_CUR);
+            require(payload_offset > 0 && uint64_t(s.st_size) > uint64_t(payload_offset) + 32, "invalid payload offset");
+            uint64_t left = s.st_size - payload_offset - 32;
+            size_t buffer = 0, position = 0, remaining = 1;
+            while (left) {
+                if (c.checkpoint) { c.checkpoint(); }
+                const size_t n = std::min<uint64_t>(left, chunk.size());
+                transfer(in.fd, chunk.data(), n, false, &sha);
+                left -= n;
+                ZSTD_inBuffer input{chunk.data(), n, 0};
+                while (input.pos < input.size) {
+                    while (buffer < destinations.size() && position == destinations[buffer]->size()) { ++buffer; position = 0; }
+                    uint8_t extra;
+                    auto * dest = buffer < destinations.size() ? const_cast<std::vector<uint8_t> *>(destinations[buffer]) : nullptr;
+                    ZSTD_outBuffer output{dest ? dest->data() + position : &extra, dest ? dest->size() - position : 1, 0};
+                    const size_t before = input.pos;
+                    remaining = ZSTD_decompressStream(codec.get(), &output, &input);
+                    zcheck(remaining);
+                    require(dest || !output.pos, "decoded state exceeds declared size");
+                    position += output.pos;
+                    require(input.pos > before || output.pos > 0, "decoder made no progress");
+                    if (!remaining) { require(!left && input.pos == input.size, "trailing or concatenated frame"); break; }
+                }
+            }
+            while (buffer < destinations.size() && position == destinations[buffer]->size()) { ++buffer; position = 0; }
+            require(!remaining && buffer == destinations.size(), "truncated decoded state");
             std::array<uint8_t, 32> saved{}, actual{};
             transfer(in.fd, saved.data(), saved.size(), false);
             sha.final(actual.data());
@@ -398,7 +469,7 @@ struct server_cache_disk::impl {
             return true;
         } catch (const std::exception & e) {
             SRV_WRN("SSD cache miss: %s\n", e.what());
-            if (best != entries.end()) {
+            if (best != entries.end() && !dynamic_cast<const server_cache_interrupted *>(&e)) {
                 try { forget(best); } catch (...) { enabled = false; }
             }
             return false;
@@ -406,20 +477,25 @@ struct server_cache_disk::impl {
     }
 
     void reject_last_load() {
+        reject(last_loaded);
+        last_loaded.clear();
+    }
+
+    void reject(const std::string & name) {
         for (auto it = entries.begin(); it != entries.end(); ++it) {
-            if (it->name == last_loaded) {
+            if (it->name == name) {
                 try { forget(it); } catch (...) { enabled = false; }
                 break;
             }
         }
-        last_loaded.clear();
     }
 };
 #else
 struct server_cache_disk::impl {
-    explicit impl(server_cache_disk_config) { throw std::runtime_error("SSD cache requires Linux and configured OpenSSL Crypto"); }
+    explicit impl(server_cache_disk_config) { throw std::runtime_error("SSD cache requires Linux, OpenSSL Crypto and LLAMA_SERVER_CACHE_ZSTD"); }
     void save(const server_prompt_cache_state &) {}
     void reject_last_load() {}
+    void reject(const std::string &) {}
     bool load(server_prompt_cache_state &, const server_tokens &, size_t, const std::function<void()> &) { return false; }
 };
 #endif
@@ -428,7 +504,154 @@ server_cache_disk::server_cache_disk(server_cache_disk_config config) : p(new im
 server_cache_disk::~server_cache_disk() = default;
 void server_cache_disk::save(const server_prompt_cache_state & state) { p->save(state); }
 void server_cache_disk::reject_last_load() { p->reject_last_load(); }
+void server_cache_disk::reject(const std::string & name) { p->reject(name); }
 bool server_cache_disk::load(server_prompt_cache_state & state, const server_tokens & tokens, size_t min_lcp,
                              const std::function<void()> & before_allocate) {
     return p->load(state, tokens, min_lcp, before_allocate);
 }
+
+struct server_cache_async::impl {
+    mutable std::mutex mutex;
+    std::condition_variable cv;
+    std::atomic<bool> stop{false};
+    bool cancel_read = false;
+    bool reserved = false;
+    bool save_active = false;
+    int reader = -1;
+    status phase = status::pending;
+    server_tokens tokens;
+    size_t min_lcp = 0;
+    std::shared_ptr<server_prompt_cache_state> result;
+    std::shared_ptr<const server_prompt_cache_state> pending_save;
+    std::vector<std::string> rejected;
+    std::function<void()> wake;
+    server_cache_disk disk;
+    std::thread thread;
+
+    server_cache_disk_config configure(server_cache_disk_config c) {
+        c.checkpoint = [this]() {
+            if (stop.load()) { throw server_cache_interrupted("cache worker stopping"); }
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!save_active && cancel_read) { throw server_cache_interrupted("cache read cancelled"); }
+        };
+        return c;
+    }
+
+    impl(server_cache_disk_config c, std::function<void()> wake) : wake(std::move(wake)), disk(configure(c)) {
+        thread = std::thread([this, cpu = c.worker_cpu]() {
+#if defined(__linux__)
+            if (cpu >= 0) {
+                cpu_set_t selected{};
+                if (cpu >= CPU_SETSIZE) {
+                    SRV_WRN("%s", "SSD worker CPU is unavailable; cache worker stopped\n");
+                    stop = true; this->wake(); return;
+                }
+                CPU_ZERO(&selected); CPU_SET(cpu, &selected);
+                // The parent may already be pinned to inference P cores. The
+                // kernel checks the container cpuset when selecting this CPU.
+                if (sched_setaffinity(0, sizeof(selected), &selected) != 0) {
+                    SRV_WRN("%s", "SSD worker CPU affinity failed; cache worker stopped\n");
+                    stop = true; this->wake(); return;
+                }
+            }
+#else
+            (void) cpu;
+#endif
+            run();
+        });
+    }
+
+    ~impl() { stop = true; cv.notify_all(); if (thread.joinable()) { thread.join(); } }
+
+    void run() {
+        std::unique_lock<std::mutex> lock(mutex);
+        while (!stop) {
+            cv.wait(lock, [&]() { return stop || (reader >= 0 && phase == status::pending) || pending_save || !rejected.empty(); });
+            if (stop) { break; }
+            if (!rejected.empty()) {
+                auto names = std::move(rejected);
+                rejected.clear();
+                lock.unlock(); for (const auto & name : names) { disk.reject(name); } lock.lock();
+            } else if (reader >= 0 && phase == status::pending) {
+                // A pending best-effort save must not pin the RAM needed by
+                // this read's allocation handshake.
+                pending_save.reset();
+                const int id = reader;
+                auto input = tokens.clone();
+                const size_t prefix = min_lcp;
+                lock.unlock();
+                auto decoded = std::make_shared<server_prompt_cache_state>();
+                const bool hit = disk.load(*decoded, input, prefix, [this, id]() {
+                    std::unique_lock<std::mutex> guard(mutex);
+                    if (stop || cancel_read || reader != id) { throw server_cache_interrupted("cache read cancelled"); }
+                    phase = status::memory;
+                    guard.unlock(); wake(); guard.lock();
+                    cv.wait(guard, [&]() { return stop || cancel_read || reserved; });
+                    if (stop || cancel_read) { throw server_cache_interrupted("cache read cancelled"); }
+                });
+                lock.lock();
+                if (cancel_read || stop) {
+                    decoded.reset(); result.reset(); reader = -1; reserved = false; cancel_read = false;
+                } else {
+                    result = hit ? std::move(decoded) : nullptr;
+                    phase = hit ? status::ready : status::miss;
+                    if (!hit) { reserved = false; }
+                }
+                lock.unlock(); wake(); lock.lock();
+            } else if (pending_save) {
+                auto state = std::move(pending_save);
+                save_active = true;
+                lock.unlock(); disk.save(*state); state.reset(); lock.lock();
+                save_active = false;
+                lock.unlock(); wake(); lock.lock();
+            }
+        }
+    }
+};
+
+server_cache_async::server_cache_async(server_cache_disk_config c, std::function<void()> wake) : p(new impl(std::move(c), std::move(wake))) {}
+server_cache_async::~server_cache_async() = default;
+bool server_cache_async::save(std::shared_ptr<const server_prompt_cache_state> state) {
+    std::lock_guard<std::mutex> lock(p->mutex);
+    if (p->stop || p->reserved) { return false; }
+    if (p->pending_save && size_t(p->pending_save->prompt.tokens.get_common_prefix(state->prompt.tokens)) != p->pending_save->prompt.tokens.size()) { return false; }
+    p->pending_save = std::move(state); // coalesce; no deep copy of KV/checkpoints
+    p->cv.notify_one();
+    return true;
+}
+server_cache_async::status server_cache_async::poll(int task, const server_tokens & tokens, size_t min_lcp) {
+    std::lock_guard<std::mutex> lock(p->mutex);
+    if (p->stop) { return status::miss; }
+    if (p->reader == task && !p->cancel_read) { return p->phase; }
+    if (p->reader >= 0) { return status::pending; }
+    p->reader = task; p->tokens = tokens.clone(); p->min_lcp = min_lcp; p->phase = status::pending;
+    p->cv.notify_one();
+    return status::pending;
+}
+void server_cache_async::grant_memory(int task) {
+    std::lock_guard<std::mutex> lock(p->mutex);
+    if (p->reader == task && p->phase == status::memory && !p->cancel_read) { p->reserved = true; p->cv.notify_one(); }
+}
+std::shared_ptr<server_prompt_cache_state> server_cache_async::take(int task) {
+    std::lock_guard<std::mutex> lock(p->mutex);
+    if (p->reader != task || (p->phase != status::ready && p->phase != status::miss)) { return {}; }
+    auto result = std::move(p->result);
+    p->reader = -1; p->reserved = false; p->tokens.clear();
+    p->cv.notify_one();
+    return result;
+}
+void server_cache_async::cancel(int task) {
+    std::lock_guard<std::mutex> lock(p->mutex);
+    if (p->reader != task) { return; }
+    if (p->phase == status::ready || p->phase == status::miss) {
+        p->result.reset(); p->reader = -1; p->reserved = false;
+    } else { p->cancel_read = true; }
+    p->cv.notify_one();
+}
+bool server_cache_async::memory_reserved() const { std::lock_guard<std::mutex> lock(p->mutex); return p->reserved; }
+void server_cache_async::reject(const std::string & name) {
+    if (name.empty()) { return; }
+    std::lock_guard<std::mutex> lock(p->mutex);
+    if (p->rejected.size() < 64) { p->rejected.push_back(name); p->cv.notify_one(); }
+}
+void server_cache_async::interrupt() { p->stop = true; p->cv.notify_all(); }

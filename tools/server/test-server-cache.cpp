@@ -10,6 +10,9 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <sys/statvfs.h>
+#include <thread>
+#include <chrono>
+#include <atomic>
 
 namespace fs = std::filesystem;
 static void check(bool ok, const char * msg) { if (!ok) { throw std::runtime_error(msg); } }
@@ -45,6 +48,12 @@ static server_prompt_cache_state state(int branch, size_t tokens = 16) {
     cp.n_tokens = tokens - 1; cp.pos_min = 0; cp.pos_max = tokens - 2; cp.id_task = 42;
     cp.data_tgt.assign(1024, 3); cp.data_dft.assign(64, 4); cp.data_spec.assign(32, 5);
     s.prompt.checkpoints.push_back(std::move(cp));
+    // Incompressible policy fixtures keep byte caps meaningful with a codec.
+    uint32_t entropy = uint32_t(branch) + 1;
+    for (auto * bytes : {&s.data.main, &s.data.drft, &s.prompt.checkpoints.front().data_tgt,
+            &s.prompt.checkpoints.front().data_dft, &s.prompt.checkpoints.front().data_spec}) {
+        for (auto & byte : *bytes) { entropy ^= entropy << 13; entropy ^= entropy >> 17; entropy ^= entropy << 5; byte = entropy; }
+    }
     return s;
 }
 static void expect_disabled(const server_cache_disk_config & c) {
@@ -53,6 +62,16 @@ static void expect_disabled(const server_cache_disk_config & c) {
     check(failed, "unsafe cache was accepted");
 }
 int main(int argc, char ** argv) {
+    {
+        server_prompt_cache cache(1, 0);
+        auto a = state(10), b = state(100);
+        check(cache.alloc(a.prompt, 600000, 0) != nullptr, "RAM initial allocation");
+        auto writer = cache.states.front();
+        check(cache.alloc(b.prompt, 600000, 0) == nullptr && cache.size() <= cache.limit_size, "writer pin remains charged");
+        check(!cache.clear_unpinned(), "cannot grant decoder memory while pinned");
+        writer.reset();
+        check(cache.clear_unpinned() && cache.alloc(b.prompt, 600000, 0), "released pin permits bounded allocation");
+    }
     if (argc == 2) {
         fixture f; f.c.path = std::string(argv[1]) + "/cache";
         check(mkdir(f.c.path.c_str(), 0700) == 0, "ENOSPC cache mkdir");
@@ -69,6 +88,33 @@ int main(int argc, char ** argv) {
         check(fs::exists(f.c.path + "/budget.json"), "ENOSPC reservation lost");
         std::cout << "Near-full filesystem preflight and cleanup gate passed on dedicated bounded tmpfs\n";
         return 0;
+    }
+    {
+        fixture f; auto a = std::make_shared<server_prompt_cache_state>(state(10));
+        std::atomic<int> wakes{0};
+        server_cache_async d(f.c, [&]() { ++wakes; });
+        check(d.save(a), "async save accepted");
+        auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (a.use_count() > 1 && std::chrono::steady_clock::now() < until) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); }
+        check(f.files() == 1, "async save published");
+        auto phase = d.poll(1, a->prompt.tokens, 0);
+        while (phase == server_cache_async::status::pending && std::chrono::steady_clock::now() < until) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5)); phase = d.poll(1, a->prompt.tokens, 0);
+        }
+        const int id = 1;
+        check(phase == server_cache_async::status::memory && !d.memory_reserved(), "decoder waits for RAM grant");
+        d.grant_memory(id);
+        while ((phase = d.poll(id, a->prompt.tokens, 0)) != server_cache_async::status::ready && std::chrono::steady_clock::now() < until) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); }
+        check(phase == server_cache_async::status::ready && d.memory_reserved(), "ready state remains charged");
+        auto loaded = d.take(id);
+        check(loaded && loaded->data.main == a->data.main && !d.memory_reserved(), "async immutable roundtrip");
+        phase = d.poll(3, a->prompt.tokens, 0);
+        while (phase == server_cache_async::status::pending && std::chrono::steady_clock::now() < until) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); phase = d.poll(3, a->prompt.tokens, 0); }
+        check(phase == server_cache_async::status::memory, "cancel fixture reached allocation gate");
+        d.cancel(3);
+        while (d.poll(4, a->prompt.tokens, 0) == server_cache_async::status::pending && std::chrono::steady_clock::now() < until) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); }
+        check(d.poll(4, a->prompt.tokens, 0) == server_cache_async::status::memory, "cancel releases reader without retiring record");
+        d.cancel(4); check(wakes > 0, "worker wakes scheduler");
     }
     {
         fixture f; auto a = state(10); server_prompt_cache_state out;
@@ -89,6 +135,13 @@ int main(int argc, char ** argv) {
         fixture f; auto a = state(10); server_prompt_cache_state out;
         { server_cache_disk d(f.c); d.save(a); f.time += 101;
           check(!d.load(out, a.prompt.tokens, 0) && f.files() == 0, "expiry"); }
+    }
+    {
+        fixture f; auto a = state(10); server_prompt_cache_state out;
+        a.captured_at = f.time - 50;
+        server_cache_disk d(f.c); d.save(a); f.time += 51;
+        check(!d.load(out, a.prompt.tokens, 0), "queue delay must not extend capture TTL");
+        d.save(a); check(f.files() == 0, "expired RAM snapshot must not restart TTL");
     }
     {
         fixture f; f.c.write_bytes = 7000; auto a = state(10);

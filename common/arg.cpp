@@ -1734,6 +1734,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) { params.cache_ssd_identity = value; }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-ssd-cpu"}, "N",
+        "pin the single SSD I/O/codec worker to an allowed logical CPU (-1: scheduler)",
+        [](common_params & params, int value) {
+            if (value < -1) { throw std::invalid_argument("cache-ssd-cpu must be >= -1"); }
+            params.cache_ssd_cpu = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

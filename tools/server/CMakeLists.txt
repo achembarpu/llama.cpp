@@ -39,6 +39,16 @@ target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd vendor::hash ${CMAKE_THREAD_LIBS_INIT})
 # Reuse the server's existing crypto dependency and its supported-build flag.
 target_link_libraries(${TARGET} PRIVATE cpp-httplib)
+option(LLAMA_SERVER_CACHE_ZSTD "Private compressed SSD prompt cache (Linux/OpenSSL, Zstd 1.5.7)" OFF)
+if (LLAMA_SERVER_CACHE_ZSTD)
+    # A static codec linked into llama-server-impl must be built with -fPIC.
+    # The private SDK recipe also pins its source/version and hides internals.
+    find_path(ZSTD_INCLUDE_DIR zstd.h REQUIRED)
+    find_library(ZSTD_LIBRARY NAMES zstd REQUIRED)
+    target_include_directories(${TARGET} PRIVATE ${ZSTD_INCLUDE_DIR})
+    target_link_libraries(${TARGET} PRIVATE ${ZSTD_LIBRARY})
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_SERVER_CACHE_ZSTD)
+endif()
 
 # llama-server-impl: server logic, reusable by app
 
@@ -78,6 +88,7 @@ target_link_libraries(test-server-admission PRIVATE server-context)
 # Private H07 policy fixture; no model, network or GPU needed.
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(test-server-cache EXCLUDE_FROM_ALL test-server-cache.cpp)
-    target_link_libraries(test-server-cache PRIVATE server-context)
+    # Exercise the same shared-library boundary as the serving executable.
+    target_link_libraries(test-server-cache PRIVATE llama-server-impl)
     target_compile_features(test-server-cache PRIVATE cxx_std_17)
 endif()

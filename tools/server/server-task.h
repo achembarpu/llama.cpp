@@ -137,6 +137,7 @@ struct task_result_state {
 struct server_task {
     int id = -1; // to be filled by server_queue
     int64_t t_queued_ms = 0; // monotonic; preserved when deferred/reoffered
+    bool cache_checked = false; // process-local async SSD lookup, preserved while waiting
 
     // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
     size_t index = 0; // used when there are multiple prompts (batch request)
@@ -639,6 +640,8 @@ struct server_prompt_data {
 struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
+    std::string disk_name; // provenance for retiring an inapplicable record
+    int64_t captured_at = 0; // original wall-clock capture, preserved by SSD reads
 
     size_t size() const {
         size_t res = data.size();
@@ -651,17 +654,19 @@ struct server_prompt_cache_state {
     }
 };
 
-class server_cache_disk;
+class server_cache_async;
 
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens);
     ~server_prompt_cache();
 
-    std::unique_ptr<server_cache_disk> disk;
+    std::unique_ptr<server_cache_async> disk;
 
-    void persist(const server_prompt_cache_state & state);
+    bool persist(const server_prompt_cache_state & state);
 
-    std::list<server_prompt_cache_state> states;
+    // A writer may pin an immutable entry. Pinned entries remain in this list
+    // and count against the RAM cap until the writer releases them.
+    std::list<std::shared_ptr<server_prompt_cache_state>> states;
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
@@ -672,6 +677,8 @@ struct server_prompt_cache {
     size_t size() const;
 
     size_t n_tokens() const;
+    size_t best_prefix(const server_tokens & tokens, size_t best) const;
+    bool clear_unpinned();
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 

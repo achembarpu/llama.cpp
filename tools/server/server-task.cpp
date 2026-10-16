@@ -12,6 +12,7 @@
 #include "server-common.h"
 
 #include <sstream>
+#include <ctime>
 
 //
 // task_params
@@ -1704,15 +1705,18 @@ server_prompt_cache::server_prompt_cache(int32_t limit_size_mib, size_t limit_to
     limit_size(1024ull * 1024ull * (limit_size_mib < 0 ? 0 : limit_size_mib)), limit_tokens(limit_tokens) {}
 server_prompt_cache::~server_prompt_cache() = default;
 
-void server_prompt_cache::persist(const server_prompt_cache_state & state) {
-    if (disk) { disk->save(state); }
+bool server_prompt_cache::persist(const server_prompt_cache_state & state) {
+    if (disk) {
+        for (const auto & entry : states) { if (entry.get() == &state) { return disk->save(entry); } }
+    }
+    return false;
 }
 
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
     for (const auto & state : states) {
-        res += state.size();
+        res += state->size();
     }
 
     return res;
@@ -1722,16 +1726,17 @@ size_t server_prompt_cache::n_tokens() const {
     size_t res = 0;
 
     for (const auto & state : states) {
-        res += state.prompt.n_tokens();
+        res += state->prompt.n_tokens();
     }
 
     return res;
 }
 
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+    if (disk && disk->memory_reserved()) { return nullptr; }
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
-        const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
+        const int cur_lcp_len = (*it)->prompt.tokens.get_common_prefix(prompt.tokens);
 
         if (cur_lcp_len == (int) prompt.tokens.size()) {
             SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
@@ -1756,9 +1761,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     // remove any cached prompts that are fully contained in the current prompt
     for (auto it = states.begin(); it != states.end();) {
-        const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
+        const int len = (*it)->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (len == (int) it->prompt.tokens.size()) {
+        if (len == (int) (*it)->prompt.tokens.size() && it->use_count() == 1) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
@@ -1769,11 +1774,13 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     if (limit_size > 0) {
         // make room before allocating the new vectors to avoid breaching the limit
-        while (!states.empty() && size() + state_size_new > limit_size) {
+        while (size() + state_size_new > limit_size) {
+            auto oldest = std::find_if(states.begin(), states.end(), [](const auto & s) { return s.use_count() == 1; });
+            if (oldest == states.end()) { return nullptr; }
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
+                    (*oldest)->size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            states.erase(oldest);
         }
     }
 
@@ -1796,7 +1803,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
-    states.push_back({
+    states.push_back(std::make_shared<server_prompt_cache_state>(server_prompt_cache_state{
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
             /*.checkpoints =*/ prompt.checkpoints,
@@ -1805,9 +1812,23 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
         },
-    });
+    }));
+    states.back()->captured_at = std::time(nullptr);
 
-    return &states.back();
+    return states.back().get();
+}
+
+size_t server_prompt_cache::best_prefix(const server_tokens & tokens, size_t best) const {
+    for (const auto & state : states) {
+        const size_t lcp = state->prompt.tokens.get_common_prefix(tokens);
+        if (lcp > best && lcp * 4 >= state->prompt.tokens.size()) { best = lcp; }
+    }
+    return best;
+}
+
+bool server_prompt_cache::clear_unpinned() {
+    states.remove_if([](const auto & state) { return state.use_count() == 1; });
+    return states.empty();
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
@@ -1825,28 +1846,21 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         // always wins; lookup is independent of the outgoing save decision.
         size_t best = lcp_best;
         for (auto it = states.begin(); it != states.end(); ++it) {
-            const size_t lcp = it->prompt.tokens.get_common_prefix(tokens_new);
-            if (lcp > best && lcp * 4 >= it->prompt.tokens.size()) {
+            const size_t lcp = (*it)->prompt.tokens.get_common_prefix(tokens_new);
+            if (lcp > best && lcp * 4 >= (*it)->prompt.tokens.size()) {
                 best = lcp; it_best = it;
             }
-        }
-        server_prompt_cache_state from_disk;
-        if (disk->load(from_disk, tokens_new, best, [&]() {
-                states.clear(); it_best = states.end();
-            })) {
-            states.push_back(std::move(from_disk));
-            it_best = states.begin();
         }
     }
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); !disk && it != states.end(); ++it) {
-        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
+        const int lcp_cur = (*it)->prompt.tokens.get_common_prefix(tokens_new);
 
-        const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
+        const float f_keep_cur = float(lcp_cur) / (*it)->prompt.tokens.size();
         const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
 
-        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
+        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", (*it)->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
 
         // don't trash large prompts
         if (f_keep_cur < 0.25f) {
@@ -1862,28 +1876,26 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     }
 
     if (it_best != states.end()) {
+        if (it_best->use_count() != 1) { return false; }
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
         {
-            auto & data = it_best->data.main;
+            const auto & data = (*it_best)->data.main;
 
             const size_t size = data.size();
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
             if (n != size) {
                 SRV_ERR("failed to restore state with size %zu\n", size);
 
-                if (disk) { disk->reject_last_load(); }
+                if (disk) { disk->reject((*it_best)->disk_name); }
                 states.erase(it_best);
 
                 return false;
             }
-
-            data.clear();
-            data.shrink_to_fit();
         }
 
         {
-            auto & data = it_best->data.drft;
+            const auto & data = (*it_best)->data.drft;
 
             if (!data.empty()) {
                 GGML_ASSERT(ctx_dft);
@@ -1893,19 +1905,15 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 if (n != size) {
                     SRV_WRN("failed to restore state with size %zu\n", size);
 
-                    if (disk) { disk->reject_last_load(); }
+                    if (disk) { disk->reject((*it_best)->disk_name); }
                     states.erase(it_best);
 
                     return false;
                 }
-
-                data.clear();
-                data.shrink_to_fit();
             }
         }
 
-        prompt = std::move(it_best->prompt);
-
+        prompt = std::move((*it_best)->prompt);
         states.erase(it_best);
     }
 
@@ -1915,9 +1923,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 void server_prompt_cache::update() {
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+            auto oldest = std::find_if(states.begin(), states.end(), [](const auto & s) { return s.use_count() == 1; });
+            if (oldest == states.end()) { break; }
+            states.erase(oldest);
         }
     }
 
@@ -1930,9 +1938,11 @@ void server_prompt_cache::update() {
     if (limit_tokens > 0) {
         while (!states.empty() && n_tokens() > limit_tokens_cur) {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+                    limit_tokens, limit_tokens_cur, states.front()->size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            auto oldest = std::find_if(states.begin(), states.end(), [](const auto & s) { return s.use_count() == 1; });
+            if (oldest == states.end()) { break; }
+            states.erase(oldest);
         }
     }
 
@@ -1941,6 +1951,6 @@ void server_prompt_cache::update() {
 
     for (const auto & state : states) {
         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
-                (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
+                (const void *)state.get(), state->prompt.n_tokens(), state->prompt.checkpoints.size(), state->size() / (1024.0 * 1024.0));
     }
 }
