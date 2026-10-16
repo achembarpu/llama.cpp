@@ -3428,7 +3428,9 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, k_cur);
     }
 
-    if (v_cur) {
+    // Expand value RMS together with its cache write during inference.
+    // This keeps both key and value cache epilogues contiguous.
+    if (v_cur && (cparams.training || v_cur->op != GGML_OP_RMS_NORM)) {
         ggml_build_forward_expand(gf, v_cur);
     }
 

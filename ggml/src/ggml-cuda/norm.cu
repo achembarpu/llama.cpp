@@ -229,6 +229,101 @@ static __global__ void rms_norm_f32(const float * x,
     }
 }
 
+template <int block_size, typename dst_t>
+static __global__ void rms_norm_set_rows_f32(
+        const float * x, dst_t * dst, const int64_t * indices,
+        const int ncols, const int64_t stride_head, const int64_t stride_token,
+        const int64_t dst_stride, const float eps) {
+    ggml_cuda_pdl_lc();
+    const int head = blockIdx.x;
+    const int token = blockIdx.y;
+    const int tid = threadIdx.x;
+    const float * xc = x + int64_t(head)*stride_head + int64_t(token)*stride_token;
+    dst_t * dstc = dst + indices[token]*dst_stride + int64_t(head)*ncols;
+
+    extern __shared__ float s_sum[];
+    ggml_cuda_pdl_sync();
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = xc[col];
+        tmp += xi * xi;
+    }
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float mean = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+    for (int col = tid; col < ncols; col += block_size) {
+        dstc[col] = scale * xc[col];
+    }
+    if constexpr (block_size > WARP_SIZE) {
+        __syncthreads();
+    }
+}
+
+template <typename dst_t>
+static void rms_norm_set_rows_f32_cuda(
+        const float * x, dst_t * dst, const int64_t * indices,
+        const int ncols, const int nheads, const int ntokens,
+        const int64_t stride_head, const int64_t stride_token,
+        const int64_t dst_stride, const float eps, cudaStream_t stream) {
+    const dim3 blocks(nheads, ntokens, 1);
+    if (ncols < 1024) {
+        const ggml_cuda_kernel_launch_params params = {blocks, dim3(256, 1, 1), 32*sizeof(float), stream};
+        ggml_cuda_kernel_launch(rms_norm_set_rows_f32<256, dst_t>, params,
+            x, dst, indices, ncols, stride_head, stride_token, dst_stride, eps);
+    } else {
+        const ggml_cuda_kernel_launch_params params = {blocks, dim3(1024, 1, 1), 32*sizeof(float), stream};
+        ggml_cuda_kernel_launch(rms_norm_set_rows_f32<1024, dst_t>, params,
+            x, dst, indices, ncols, stride_head, stride_token, dst_stride, eps);
+    }
+}
+
+
+// Narrow Gemma post-FFN path. Keep the stock 1024-thread RMS reduction and
+// fused multiply/add expression; the final multiply follows its rounded result.
+static __global__ void rms_norm_mul_add_scalar_f32(
+        const float * x, const float * mul, const float * add, const float * scalar,
+        float * dst, const float eps) {
+    ggml_cuda_pdl_lc();
+    constexpr int ncols = 3840;
+    constexpr int block_size = 1024;
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float * xc = x + int64_t(row)*ncols;
+    const float * addc = add + int64_t(row)*ncols;
+    float * dstc = dst + int64_t(row)*ncols;
+    extern __shared__ float s_sum[];
+    ggml_cuda_pdl_sync();
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = xc[col];
+        tmp += xi * xi;
+    }
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float mean = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+    for (int col = tid; col < ncols; col += block_size) {
+        const float combined = scale * xc[col] * mul[col] + addc[col];
+        dstc[col] = combined * scalar[0];
+    }
+}
+
+void ggml_cuda_op_rms_norm_mul_add_scalar_fused(
+        ggml_backend_cuda_context & ctx, ggml_tensor * rms,
+        ggml_tensor * mul, ggml_tensor * add, ggml_tensor * last) {
+    const ggml_tensor * x = rms->src[0];
+    const ggml_tensor * weights = mul->src[1];
+    const ggml_tensor * residual = add->src[1];
+    const ggml_tensor * scalar = last->src[1];
+    float eps; memcpy(&eps, rms->op_params, sizeof(eps));
+    GGML_ASSERT(eps >= 0.0f && x->ne[0] == 3840);
+    const ggml_cuda_kernel_launch_params params = {
+        dim3(x->ne[1], 1, 1), dim3(1024, 1, 1), 32*sizeof(float), ctx.stream()};
+    ggml_cuda_kernel_launch(rms_norm_mul_add_scalar_f32, params,
+        (const float *) x->data, (const float *) weights->data,
+        (const float *) residual->data, (const float *) scalar->data,
+        (float *) last->data, eps);
+}
+
 template <int block_size>
 static __global__ void rms_norm_back_f32(
         const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
@@ -609,6 +704,31 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     rms_norm_f32_cuda(src0, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+void ggml_cuda_op_rms_norm_set_rows_fused(
+        ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * set_rows) {
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * indices = set_rows->src[1];
+    float eps;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && indices->type == GGML_TYPE_I64);
+    GGML_ASSERT(x->nb[0] == sizeof(float) && x->ne[3] == 1);
+    const int ncols = x->ne[0], nheads = x->ne[1], ntokens = x->ne[2];
+    const int64_t stride_head = x->nb[1]/sizeof(float);
+    const int64_t stride_token = x->nb[2]/sizeof(float);
+    const int64_t dst_stride = set_rows->nb[1]/ggml_type_size(set_rows->type);
+    if (set_rows->type == GGML_TYPE_F16) {
+        rms_norm_set_rows_f32_cuda((const float *) x->data, (half *) set_rows->data,
+            (const int64_t *) indices->data, ncols, nheads, ntokens,
+            stride_head, stride_token, dst_stride, eps, ctx.stream());
+    } else {
+        GGML_ASSERT(set_rows->type == GGML_TYPE_F32);
+        rms_norm_set_rows_f32_cuda((const float *) x->data, (float *) set_rows->data,
+            (const int64_t *) indices->data, ncols, nheads, ntokens,
+            stride_head, stride_token, dst_stride, eps, ctx.stream());
+    }
 }
 
 void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * scale_tensor) {
