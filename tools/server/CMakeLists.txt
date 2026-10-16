@@ -19,6 +19,7 @@ add_library(${TARGET} STATIC
     server-context.h
     server-stream.cpp
     server-stream.h
+    server-admission.h
     server-tools.cpp
     server-tools.h
     server-mcp.cpp
@@ -67,3 +68,6 @@ install(TARGETS ${TARGET} RUNTIME)
 
 target_link_libraries(${TARGET} PRIVATE llama-server-impl)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+add_executable(test-server-admission test-server-admission.cpp)
+target_link_libraries(test-server-admission PRIVATE server-context)

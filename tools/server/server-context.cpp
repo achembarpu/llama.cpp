@@ -7,6 +7,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-admission.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -1015,6 +1016,7 @@ private:
 
     // slots / clients
     std::vector<server_slot> slots;
+    size_t prefill_cursor = 0;
 
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
@@ -1345,6 +1347,11 @@ private:
 
         n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model_tgt);
 
+        if (params_base.ctx_admission && (!params_base.kv_unified || params_base.ctx_shift || mctx || params_base.embedding)) {
+            SRV_ERR("%s", "ctx-admission requires unified text KV, no embeddings and --no-context-shift\n");
+            return false;
+        }
+
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
 
@@ -1442,7 +1449,8 @@ private:
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
             slot.callback_on_release = [this](int id_slot) {
-                queue_tasks.pop_deferred_task(id_slot);
+                if (params_base.ctx_admission) { queue_tasks.retry_deferred(); }
+                else { queue_tasks.pop_deferred_task(id_slot); }
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {
@@ -1693,6 +1701,33 @@ private:
         return nullptr;
     }
 
+    int64_t token_reservation(const server_task & task) const {
+        const int predict = task.need_sampling() ?
+            (task.params.n_predict == -1 ? params_base.n_predict : task.params.n_predict) : 0;
+        const int headroom = common_speculative_n_max(&params_base.speculative) + 2;
+        return server_token_reservation(task.n_tokens(), predict, n_ctx, headroom);
+    }
+
+    int64_t tokens_reserved() const {
+        int64_t used = 0;
+        for (const auto & slot : slots) {
+            if (slot.is_processing()) { used += token_reservation(*slot.task); }
+        }
+        return used;
+    }
+
+    void reject_task_tree(const server_task & task, const std::string & message, error_type type) {
+        send_error(task, message, type);
+        for (const auto & child : task.child_tasks) { reject_task_tree(child, message, type); }
+    }
+
+    void defer_inference(server_task && task) {
+        const size_t limit = params_base.ctx_admission ? params_base.queue_limit : SIZE_MAX;
+        if (!queue_tasks.defer(std::move(task), limit)) {
+            reject_task_tree(task, "Request queue is full; retry later.", ERROR_TYPE_UNAVAILABLE);
+        }
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
@@ -1773,6 +1808,21 @@ private:
                 SLT_INF(*ret, "selected slot by LRU, n_tokens = %d, t_last = %" PRId64 "\n", ret->prompt.n_tokens(), ret->t_last_used);
 
                 update_cache = true;
+            }
+        }
+
+        if (ret && params_base.ctx_admission && !ret->is_processing()) {
+            int64_t idle_tokens = 0;
+            for (const auto & slot : slots) {
+                if (&slot != ret && !slot.is_processing()) { idle_tokens += slot.prompt.n_tokens(); }
+            }
+            const int64_t reserved = tokens_reserved() + token_reservation(task) * (1 + task.child_tasks.size());
+            for (auto & slot : slots) {
+                if (idle_tokens <= n_ctx - reserved) { break; }
+                if (&slot == ret || slot.is_processing()) { continue; }
+                idle_tokens -= slot.prompt.n_tokens();
+                if (prompt_cache) { slot.prompt_save(*prompt_cache); prompt_cache->update(); }
+                slot.prompt_clear();
             }
         }
 
@@ -2842,6 +2892,27 @@ private:
 
                     const int id_task = task.id;
 
+                    if (params_base.ctx_admission) {
+                        const int64_t single = token_reservation(task);
+                        const int64_t requested = single * (1 + task.child_tasks.size());
+                        if (task.id_slot < -1 || task.id_slot >= (int) slots.size() ||
+                            single > n_ctx_slot() || requested > n_ctx ||
+                            task.child_tasks.size() >= slots.size() || task.tokens.has_mtmd) {
+                            reject_task_tree(task, "Prompt, maximum generation and speculative headroom exceed serving capacity, or unsupported slot/input.", ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+                        if (ggml_time_ms() - task.t_queued_ms >= 1000ll * params_base.queue_timeout) {
+                            reject_task_tree(task, "Request queue wait expired; retry later.", ERROR_TYPE_UNAVAILABLE);
+                            break;
+                        }
+                        if (!server_token_fits(tokens_reserved(), requested, n_ctx)) {
+                            SRV_DBG("token admission deferred task %d, used=%" PRId64 ", requested=%" PRId64 ", capacity=%d\n",
+                                    task.id, tokens_reserved(), requested, n_ctx);
+                            defer_inference(std::move(task));
+                            break;
+                        }
+                    }
+
                     server_slot * slot = get_available_slot(task);
 
                     //
@@ -2851,14 +2922,14 @@ private:
                     if (slot == nullptr) {
                         // if no slot is available, we defer this task for processing later
                         SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
-                        queue_tasks.defer(std::move(task));
+                        defer_inference(std::move(task));
                         break;
                     }
 
                     if (slot->is_processing()) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
-                        queue_tasks.defer(std::move(task));
+                        defer_inference(std::move(task));
                         break;
                     }
 
@@ -2868,7 +2939,7 @@ private:
                         std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->id);
                         if (child_slots.size() < n_child_tasks) {
                             SRV_DBG("not enough free slots for child tasks, n_free = %zu, n_children = %zu, defer task, id_task = %d\n", child_slots.size(), n_child_tasks, id_task);
-                            queue_tasks.defer(std::move(task));
+                            defer_inference(std::move(task));
                             break;
                         }
                         if (!launch_slots_with_parent_task(*slot, child_slots, std::move(task))) {
@@ -3254,6 +3325,12 @@ private:
 #endif
 
     void update_slots() {
+        if (params_base.ctx_admission) {
+            auto expired = queue_tasks.expire_deferred(ggml_time_ms() - 1000ll * params_base.queue_timeout);
+            for (const auto & task : expired) {
+                reject_task_tree(task, "Request queue wait expired; retry later.", ERROR_TYPE_UNAVAILABLE);
+            }
+        }
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -3580,7 +3657,15 @@ private:
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
-            iterate(slots, [&](server_slot & slot) {
+            std::vector<server_slot *> prompt_order;
+            int n_pending = 0;
+            for (size_t i = 0; i < slots.size(); ++i) {
+                auto & slot = slots[(prefill_cursor + i) % slots.size()];
+                prompt_order.push_back(&slot);
+                n_pending += slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT;
+            }
+            prefill_cursor = (prefill_cursor + 1) % slots.size();
+            iterate(prompt_order, [&](server_slot & slot) {
                 if (!add_ok || batch.size() >= n_batch) {
                     return; // batch is full, skip remaining slots
                 }
@@ -3606,6 +3691,8 @@ private:
 
                     // used to determine the number of tokens added to the batch for the current slot
                     const auto n_tokens_prev = batch.size();
+                    const int prompt_limit = n_pending > 1 && slot.task->need_sampling() && !slot.task->tokens.has_mtmd ?
+                        std::min<int>(n_batch, n_tokens_prev + n_ubatch) : n_batch;
 
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
@@ -4053,7 +4140,7 @@ private:
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < prompt_limit) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
