@@ -136,6 +136,7 @@ struct task_result_state {
 
 struct server_task {
     int id = -1; // to be filled by server_queue
+    int64_t t_queued_ms = 0; // monotonic; preserved when deferred/reoffered
 
     // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
     size_t index = 0; // used when there are multiple prompts (batch request)

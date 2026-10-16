@@ -28,6 +28,7 @@ static bool task_resets_idle_timer(server_task_type type) {
 int server_queue::post(server_task && task, bool front) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     GGML_ASSERT(task.id != -1);
+    if (task.t_queued_ms == 0) { task.t_queued_ms = ggml_time_ms(); }
     // if this is cancel task make sure to clean up pending tasks
     if (task.type == SERVER_TASK_TYPE_CANCEL) {
         cleanup_pending_task(task.id_target);
@@ -51,6 +52,7 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     bool reset_timer = false;
     for (auto & task : tasks) {
+        if (task.t_queued_ms == 0) { task.t_queued_ms = ggml_time_ms(); }
         if (task.id == -1) {
             task.id = id++;
         }
@@ -73,11 +75,36 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
     return 0;
 }
 
-void server_queue::defer(server_task && task) {
+bool server_queue::defer(server_task && task, size_t limit) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
+    if (queue_tasks_deferred.size() >= limit) { return false; }
     QUE_DBG("defer task, id = %d\n", task.id);
     queue_tasks_deferred.push_back(std::move(task));
     time_last_task = ggml_time_ms();
+    condition_tasks.notify_one();
+    return true;
+}
+
+std::vector<server_task> server_queue::expire_deferred(int64_t before_ms) {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    std::vector<server_task> expired;
+    for (auto it = queue_tasks_deferred.begin(); it != queue_tasks_deferred.end();) {
+        if (it->t_queued_ms <= before_ms) {
+            expired.push_back(std::move(*it));
+            it = queue_tasks_deferred.erase(it);
+        } else { ++it; }
+    }
+    return expired;
+}
+
+void server_queue::retry_deferred() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    // Reoffer every bounded waiter once. A large request must not hide a
+    // smaller admissible one, and release/cancellation must wake all slots.
+    while (!queue_tasks_deferred.empty()) {
+        queue_tasks.push_back(std::move(queue_tasks_deferred.front()));
+        queue_tasks_deferred.pop_front();
+    }
     condition_tasks.notify_one();
 }
 

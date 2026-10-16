@@ -56,7 +56,9 @@ public:
     int post(std::vector<server_task> && tasks, bool front = false);
 
     // Add a new task, but defer until one slot is available
-    void defer(server_task && task);
+    bool defer(server_task && task, size_t limit = SIZE_MAX);
+    std::vector<server_task> expire_deferred(int64_t before_ms);
+    void retry_deferred();
 
     // Get the next id for creating a new task
     int get_new_id();
