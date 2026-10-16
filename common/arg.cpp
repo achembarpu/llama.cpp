@@ -1724,6 +1724,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--cache-ssd-path"}, "DIR",
+        "opt-in private Linux SSD prompt cache (32 GiB, 14 days, >=8192 tokens, <=16 GiB writes/day); requires cache-ram and exact manifest identity",
+        [](common_params & params, const std::string & value) { params.cache_ssd_path = value; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-ssd-identity"}, "SHA256",
+        "SHA256 of exact engine/model/head/template/context/KV manifest; required with cache-ssd-path",
+        [](common_params & params, const std::string & value) { params.cache_ssd_identity = value; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

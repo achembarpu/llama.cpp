@@ -641,6 +641,8 @@ struct common_params {
     bool ctx_admission = false;
     int32_t queue_limit = 8;
     int32_t queue_timeout = 120; // seconds from posting, including deferred time
+    std::string cache_ssd_path;
+    std::string cache_ssd_identity;
 
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT

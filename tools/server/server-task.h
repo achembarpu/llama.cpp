@@ -651,11 +651,15 @@ struct server_prompt_cache_state {
     }
 };
 
+class server_cache_disk;
+
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
-        this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
-        this->limit_tokens = limit_tokens;
-    }
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens);
+    ~server_prompt_cache();
+
+    std::unique_ptr<server_cache_disk> disk;
+
+    void persist(const server_prompt_cache_state & state);
 
     std::list<server_prompt_cache_state> states;
 

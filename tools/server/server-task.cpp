@@ -1,4 +1,5 @@
 #include "server-task.h"
+#include "server-cache.h"
 
 #include "build-info.h"
 #include "server-chat.h"
@@ -1699,6 +1700,14 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+server_prompt_cache::server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) :
+    limit_size(1024ull * 1024ull * (limit_size_mib < 0 ? 0 : limit_size_mib)), limit_tokens(limit_tokens) {}
+server_prompt_cache::~server_prompt_cache() = default;
+
+void server_prompt_cache::persist(const server_prompt_cache_state & state) {
+    if (disk) { disk->save(state); }
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
@@ -1811,8 +1820,27 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     auto it_best = states.end();
 
+    if (disk) {
+        // With SSD enabled, prefer the longest useful prefix. A live/RAM tie
+        // always wins; lookup is independent of the outgoing save decision.
+        size_t best = lcp_best;
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            const size_t lcp = it->prompt.tokens.get_common_prefix(tokens_new);
+            if (lcp > best && lcp * 4 >= it->prompt.tokens.size()) {
+                best = lcp; it_best = it;
+            }
+        }
+        server_prompt_cache_state from_disk;
+        if (disk->load(from_disk, tokens_new, best, [&]() {
+                states.clear(); it_best = states.end();
+            })) {
+            states.push_back(std::move(from_disk));
+            it_best = states.begin();
+        }
+    }
+
     // find the most similar cached prompt, that would also preserve the most context
-    for (auto it = states.begin(); it != states.end(); ++it) {
+    for (auto it = states.begin(); !disk && it != states.end(); ++it) {
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
 
         const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
@@ -1844,6 +1872,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             if (n != size) {
                 SRV_ERR("failed to restore state with size %zu\n", size);
 
+                if (disk) { disk->reject_last_load(); }
+                states.erase(it_best);
+
                 return false;
             }
 
@@ -1861,6 +1892,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
                 if (n != size) {
                     SRV_WRN("failed to restore state with size %zu\n", size);
+
+                    if (disk) { disk->reject_last_load(); }
+                    states.erase(it_best);
 
                     return false;
                 }
