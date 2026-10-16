@@ -2339,8 +2339,8 @@ const slot_info_vec_t *   sinfos_in) {
                     }
                     // Renaming the owner swaps IDs, retaining a one-to-one mapping.
                     id = id == seq_id ? saved_owner : id;
-                    if (cell.seqs.test(id)) {
-                        throw std::runtime_error("duplicate foreign KV membership");
+                    if (cell.seqs.test(id) || seq_to_stream[id] != strm) {
+                        throw std::runtime_error("duplicate or cross-stream foreign KV membership");
                     }
                     cell.seqs.set(id);
                 }
