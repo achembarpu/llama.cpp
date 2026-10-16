@@ -306,6 +306,14 @@ Consider setting `CUDA_SCALE_LAUNCH_QUEUES=4x`, which increases the CUDA command
 Override default, speed-optimized compute types for cuBLAS matrix multiplications.
 Legal values: `auto`, `f16`, `fp16`, `bf16`, `f32`, `fp32`.
 
+#### GGML_CUDA_GRAPH_CACHE_CAPACITY
+
+Maximum CUDA graphs retained per backend context, from 1 to 128 (default: 8).
+New graph keys evict the least recently used entry when the cache is full.
+Eviction waits for the backend stream before freeing executable memory. Lower
+values reduce retained graph memory but may increase capture and warmup work.
+This bounds the number of cached graphs, not total VRAM or a single graph's size.
+
 #### GGML_CUDA_MMQ_PREC
 
 Override the activation precision that the model requests for NVFP4 and MXFP4 matrix multiplications.

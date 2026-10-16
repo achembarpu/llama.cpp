@@ -2641,6 +2641,38 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 }
 
 #ifdef USE_CUDA_GRAPH
+static ggml_cuda_graph * ggml_cuda_graph_get(ggml_backend_cuda_context * cuda_ctx, const void * key) {
+    static const size_t capacity = []() -> size_t {
+        const char * value = getenv("GGML_CUDA_GRAPH_CACHE_CAPACITY");
+        if (!value) { return 8; }
+        char * end = nullptr;
+        const long n = strtol(value, &end, 10);
+        if (end == value || *end != '\0' || n < 1 || n > 128) {
+            GGML_LOG_WARN("GGML_CUDA_GRAPH_CACHE_CAPACITY must be between 1 and 128; using 8\n");
+            return 8;
+        }
+        return size_t(n);
+    }();
+
+    auto & cache = cuda_ctx->cuda_graphs;
+    if (cache.find(key) == cache.end() && cache.size() >= capacity) {
+        // Reclaim executable memory before another capture. Never evict the graph currently being evaluated.
+        ggml_cuda_set_device(cuda_ctx->device);
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        while (cache.size() >= capacity) {
+            auto oldest = cache.begin();
+            for (auto it = cache.begin(); it != cache.end(); ++it) {
+                if (it->second->last_used_time < oldest->second->last_used_time) {
+                    oldest = it;
+                }
+            }
+            GGML_LOG_DEBUG("%s: evicting least recently used CUDA graph (%zu/%zu)\n", __func__, cache.size(), capacity);
+            cache.erase(oldest);
+        }
+    }
+    return cuda_ctx->cuda_graph(key);
+}
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
@@ -2682,7 +2714,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     bool res = false;
 
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
-    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    ggml_cuda_graph * graph = ggml_cuda_graph_get(cuda_ctx, graph_key);
 
     if (cgraph->uid != 0 &&
         cgraph->uid == graph->uid) {
@@ -2721,7 +2753,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 }
 
 static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
-    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    ggml_cuda_graph * graph = ggml_cuda_graph_get(cuda_ctx, graph_key);
 
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
@@ -4580,7 +4612,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
 
 #ifdef USE_CUDA_GRAPH
-        ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        ggml_cuda_graph * graph = ggml_cuda_graph_get(cuda_ctx, graph_key);
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
             if (graph->graph != nullptr) {
                 CUDA_CHECK(cudaGraphDestroy(graph->graph));
@@ -4600,7 +4632,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     }
 
     if (use_cuda_graph) {
-        ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        ggml_cuda_graph * graph = ggml_cuda_graph_get(cuda_ctx, graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
         }
@@ -4618,7 +4650,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
-    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    ggml_cuda_graph * graph = ggml_cuda_graph_get(cuda_ctx, graph_key);
 
     if (graph->graph == nullptr) {
         if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
@@ -4647,7 +4679,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
-    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    ggml_cuda_graph * graph = ggml_cuda_graph_get(cuda_ctx, graph_key);
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
