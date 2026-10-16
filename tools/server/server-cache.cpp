@@ -632,6 +632,10 @@ void server_cache_async::grant_memory(int task) {
     std::lock_guard<std::mutex> lock(p->mutex);
     if (p->reader == task && p->phase == status::memory && !p->cancel_read) { p->reserved = true; p->cv.notify_one(); }
 }
+size_t server_cache_async::result_prefix(int task, const server_tokens & tokens) const {
+    std::lock_guard<std::mutex> lock(p->mutex);
+    return p->reader == task && p->result ? p->result->prompt.tokens.get_common_prefix(tokens) : 0;
+}
 std::shared_ptr<server_prompt_cache_state> server_cache_async::take(int task) {
     std::lock_guard<std::mutex> lock(p->mutex);
     if (p->reader != task || (p->phase != status::ready && p->phase != status::miss)) { return {}; }
@@ -641,12 +645,16 @@ std::shared_ptr<server_prompt_cache_state> server_cache_async::take(int task) {
     return result;
 }
 void server_cache_async::cancel(int task) {
-    std::lock_guard<std::mutex> lock(p->mutex);
+    std::unique_lock<std::mutex> lock(p->mutex);
     if (p->reader != task) { return; }
+    bool released = false;
     if (p->phase == status::ready || p->phase == status::miss) {
-        p->result.reset(); p->reader = -1; p->reserved = false;
+        p->result.reset(); p->reader = -1; p->reserved = false; p->tokens.clear();
+        released = true;
     } else { p->cancel_read = true; }
     p->cv.notify_one();
+    lock.unlock();
+    if (released) { p->wake(); }
 }
 bool server_cache_async::memory_reserved() const { std::lock_guard<std::mutex> lock(p->mutex); return p->reserved; }
 void server_cache_async::reject(const std::string & name) {

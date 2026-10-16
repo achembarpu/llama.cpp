@@ -35,6 +35,7 @@ public:
     ~server_cache_async();
     bool save(std::shared_ptr<const server_prompt_cache_state> state);
     status poll(int task, const server_tokens & tokens, size_t min_lcp);
+    size_t result_prefix(int task, const server_tokens & tokens) const;
     void grant_memory(int task);
     std::shared_ptr<server_prompt_cache_state> take(int task);
     void cancel(int task);
