@@ -14,6 +14,7 @@
 #include "llama.h"
 
 #include <vector>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -118,6 +119,58 @@ int main(int argc, char ** argv) {
 
     fprintf(stderr, "%s : successfully decoded with restored state, generated: '%s'\n", __func__, next_token_str.c_str());
     fprintf(stderr, "%s : SUCCESS - state restore works with fragmented KV cache\n", __func__);
+
+    // A single-sequence restore must retain foreign allocation geometry without exposing foreign K/V as live sequences.
+    llama_memory_clear(mem, true);
+    GGML_ASSERT(llama_state_seq_set_data(ctx, seq_state.data(), seq_state.size(), 0) == seq_state.size());
+    GGML_ASSERT(llama_memory_seq_pos_max(mem, 0) == (llama_pos) tokens.size() - 1);
+    GGML_ASSERT(llama_memory_seq_pos_min(mem, 1) == -1);
+    GGML_ASSERT(llama_memory_seq_pos_max(mem, 2) == -1);
+
+    // MTP rollback uses partial checkpoints. It must not turn reservations into real sequences or lose the owner.
+    const auto partial_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    std::vector<uint8_t> partial(llama_state_seq_get_size_ext(ctx, 0, partial_flags));
+    GGML_ASSERT(llama_state_seq_get_data_ext(ctx, partial.data(), partial.size(), 0, partial_flags) == partial.size());
+    batch.clear();
+    batch.add(tokens[0], tokens.size(), 0, true);
+    GGML_ASSERT(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0);
+    GGML_ASSERT(llama_state_seq_set_data_ext(ctx, partial.data(), partial.size(), 0, partial_flags) == partial.size());
+    GGML_ASSERT(llama_memory_seq_pos_max(mem, 0) == (llama_pos) tokens.size() - 1);
+    GGML_ASSERT(llama_memory_seq_pos_max(mem, 1) == -1);
+
+    // Starting another sequence relinquishes its allocation-only history before attention can use it.
+    batch.clear();
+    batch.add(tokens[0], 0, 2, true);
+    GGML_ASSERT(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0);
+    GGML_ASSERT(llama_memory_seq_pos_min(mem, 2) == 0);
+    GGML_ASSERT(llama_memory_seq_pos_max(mem, 2) == 0);
+    GGML_ASSERT(llama_memory_seq_pos_max(mem, 1) == -1);
+    GGML_ASSERT(llama_memory_seq_pos_max(mem, 0) == (llama_pos) tokens.size() - 1);
+
+    // Explicit owner removal must also release every reservation.
+    llama_memory_clear(mem, true);
+    GGML_ASSERT(llama_state_seq_set_data(ctx, seq_state.data(), seq_state.size(), 0) == seq_state.size());
+    GGML_ASSERT(llama_memory_seq_rm(mem, 0, -1, -1));
+    for (int s = 0; s < params.n_parallel; ++s) {
+        GGML_ASSERT(llama_memory_seq_pos_max(mem, s) == -1);
+    }
+    fprintf(stderr, "%s : allocator reservation remap, rollback, activation and cleanup passed\n", __func__);
+
+    const uint8_t layout_magic[] = {'K', 'V', 'L', '2'};
+    auto corrupt = seq_state;
+    auto marker = std::search(corrupt.begin(), corrupt.end(), std::begin(layout_magic), std::end(layout_magic));
+    GGML_ASSERT(marker != corrupt.end());
+    const size_t offset = marker - corrupt.begin();
+    const size_t foreign_count_offset = offset + 3*sizeof(uint32_t) + tokens.size()*sizeof(uint32_t) + sizeof(llama_seq_id);
+    GGML_ASSERT(foreign_count_offset + sizeof(uint32_t) <= corrupt.size());
+    const uint32_t invalid_count = UINT32_MAX;
+    memcpy(corrupt.data() + foreign_count_offset, &invalid_count, sizeof(invalid_count));
+    GGML_ASSERT(llama_state_seq_set_data(ctx, corrupt.data(), corrupt.size(), 0) == 0);
+    for (int s = 0; s < params.n_parallel; ++s) {
+        GGML_ASSERT(llama_memory_seq_pos_max(mem, s) == -1);
+    }
+    GGML_ASSERT(llama_state_seq_set_data(ctx, seq_state.data(), seq_state.size(), 0) == seq_state.size());
+    fprintf(stderr, "%s : malformed allocator bounds rejected without reservations\n", __func__);
 
     llama_sampler_free(smpl);
 

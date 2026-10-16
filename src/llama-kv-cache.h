@@ -354,6 +354,9 @@ private:
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 
     void state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo);
+
+    bool seq_rm_impl(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+    void release_reservations();
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {
