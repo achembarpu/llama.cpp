@@ -2095,8 +2095,10 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
             add_cell = add_cell && !cells.is_empty(i);
             add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
 
-            // check the cell is not SWA-masked
-            if (add_cell && seq_id != -1) {
+            // A full state must preserve the live sequence's rewindable SWA rows.
+            // Compact only partial checkpoints; dropping assigned rows here can
+            // force a different checkpoint/re-tokenization path after a restore.
+            if (add_cell && seq_id != -1 && (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
                 const bool is_masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
 
                 add_cell = !is_masked;
@@ -2131,6 +2133,22 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         // skip empty streams
         if (cell_count == 0) {
             continue;
+        }
+
+        // Full sequence snapshots retain the physical reduction order and the
+        // allocation head. Partial checkpoints and whole-context states keep
+        // their existing encoding and placement behavior.
+        if (seq_id >= 0 && !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+            const uint32_t magic = 0x314c564b; // KVL1
+            const uint32_t capacity = cells.size();
+            io.write(&magic, sizeof(magic));
+            io.write(&capacity, sizeof(capacity));
+            io.write(&v_heads[s], sizeof(v_heads[s]));
+            for (const auto & range : cr.data) {
+                for (uint32_t i = range.first; i < range.second; ++i) {
+                    io.write(&i, sizeof(i));
+                }
+            }
         }
 
         state_write_meta(io, cr, seq_id);
@@ -2193,9 +2211,40 @@ const slot_info_vec_t *   sinfos_in) {
         const uint32_t strm = seq_id == -1 ? s : seq_to_stream[seq_id];
 
         slot_info sinfo;
+        slot_info saved_layout;
+        uint32_t saved_head = 0;
+        const bool keep_layout = seq_id >= 0 && !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        const slot_info * layout = sinfos_in ? &(*sinfos_in)[s] : nullptr;
+        if (keep_layout) {
+            uint32_t magic;
+            uint32_t capacity;
+            io.read(&magic, sizeof(magic));
+            io.read(&capacity, sizeof(capacity));
+            io.read(&saved_head, sizeof(saved_head));
+            if (magic != 0x314c564b || capacity != v_cells[strm].size() || cell_count > capacity || saved_head > capacity) {
+                throw std::runtime_error("invalid or incompatible sequence KV layout");
+            }
+            saved_layout.s0 = strm;
+            saved_layout.s1 = strm;
+            saved_layout.resize(1);
+            saved_layout.strm[0] = strm;
+            saved_layout.idxs[0].resize(cell_count);
+            std::vector<bool> seen(capacity, false);
+            for (uint32_t & idx : saved_layout.idxs[0]) {
+                io.read(&idx, sizeof(idx));
+                if (idx >= capacity || seen[idx]) {
+                    throw std::runtime_error("invalid or duplicate sequence KV cell");
+                }
+                seen[idx] = true;
+            }
+            if (layout && (layout->strm != saved_layout.strm || layout->idxs != saved_layout.idxs)) {
+                throw std::runtime_error("sequence KV layout differs from its mirrored cache");
+            }
+            layout = &saved_layout;
+        }
 
         bool res = true;
-        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr);
+        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, layout);
 
         try {
             res = res && state_read_data(io, strm, cell_count, sinfo);
@@ -2206,6 +2255,9 @@ const slot_info_vec_t *   sinfos_in) {
         if (!res) {
             state_clear(seq_id, strm, sinfo);
             throw std::runtime_error("failed to restore kv cache");
+        }
+        if (keep_layout) {
+            v_heads[strm] = saved_head;
         }
 
         if (sinfos_out) {
