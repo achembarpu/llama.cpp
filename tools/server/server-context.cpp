@@ -1,4 +1,6 @@
 #include "server-context.h"
+#include "server-cache.h"
+#include "../../src/llama-ext.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-decision.h"
@@ -327,6 +329,10 @@ struct server_slot {
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+
+        if (task_prev && task_prev->params.cache_prompt && task_prev->params.lora.empty()) {
+            prompt_cache.persist(*cur);
         }
 
         return true;
@@ -1514,6 +1520,25 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            if (!params_base.cache_ssd_path.empty()) {
+                // The physical-layout format is qualified only for one text
+                // slot, without adapters. Other profiles retain RAM caching.
+                if (params_base.n_parallel != 1 || !params_base.lora_adapters.empty() ||
+                    (ctx_dft && llama_get_ctx_other(ctx_dft) != ctx_tgt)) {
+                    SRV_WRN("%s", "SSD cache disabled: requires one slot, no adapters and shared-KV/no separate draft context\n");
+                } else {
+                    try {
+                        server_cache_disk_config config;
+                        config.path = params_base.cache_ssd_path;
+                        config.identity = params_base.cache_ssd_identity;
+                        config.max_tokens = n_ctx;
+                        config.max_state_bytes = prompt_cache->limit_size ? prompt_cache->limit_size : (16ull << 30);
+                        prompt_cache->disk = std::make_unique<server_cache_disk>(std::move(config));
+                    } catch (const std::exception & e) {
+                        SRV_WRN("SSD cache disabled: %s\n", e.what());
+                    }
+                }
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -1832,14 +1857,15 @@ private:
             // cache prompts only for the tasks that reuse them
             update_cache = update_cache && !task.is_stateless();
 
-            if (update_cache) {
+            const bool load_ssd = prompt_cache && prompt_cache->disk && task.type == SERVER_TASK_TYPE_COMPLETION;
+            if (update_cache || load_ssd) {
                 SRV_TRC("%s", "updating prompt cache\n");
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                if (update_cache) { ret->prompt_save(*prompt_cache); }
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                if ((!prompt_cache->disk || task.params.cache_prompt) && !ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
                 }
 

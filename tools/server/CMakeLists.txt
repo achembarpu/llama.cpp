@@ -9,6 +9,8 @@ add_library(${TARGET} STATIC
     server-chat.h
     server-task.cpp
     server-task.h
+    server-cache.cpp
+    server-cache.h
     server-queue.cpp
     server-queue.h
     server-common.cpp
@@ -34,7 +36,9 @@ endif()
 
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
-target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET} PUBLIC llama-common mtmd vendor::hash ${CMAKE_THREAD_LIBS_INIT})
+# Reuse the server's existing crypto dependency and its supported-build flag.
+target_link_libraries(${TARGET} PRIVATE cpp-httplib)
 
 # llama-server-impl: server logic, reusable by app
 
@@ -71,3 +75,9 @@ target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
 add_executable(test-server-admission test-server-admission.cpp)
 target_link_libraries(test-server-admission PRIVATE server-context)
+# Private H07 policy fixture; no model, network or GPU needed.
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test-server-cache EXCLUDE_FROM_ALL test-server-cache.cpp)
+    target_link_libraries(test-server-cache PRIVATE server-context)
+    target_compile_features(test-server-cache PRIVATE cxx_std_17)
+endif()
