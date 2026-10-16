@@ -24,7 +24,7 @@ struct fixture {
         char name[] = "/tmp/h07-policy-XXXXXX";
         path = mkdtemp(name);
         c.path = path; c.identity = std::string(64, 'a'); c.max_bytes = 100000;
-        c.max_state_bytes = 12000; c.write_bytes = 100000; c.free_bytes = 0;
+        c.max_state_bytes = 12000; c.free_bytes = 0;
         c.min_tokens = 8; c.max_tokens = 128; c.ttl_seconds = 100;
         c.clock = [this]() { return time; };
     }
@@ -85,7 +85,7 @@ int main(int argc, char ** argv) {
         size_t entries = 0;
         for (auto & p : fs::directory_iterator(f.c.path)) { if (p.path().extension() == ".bin") { ++entries; } }
         check(entries == 0 && !fs::exists(f.c.path + "/.entry.tmp"), "ENOSPC partial cleanup");
-        check(fs::exists(f.c.path + "/budget.json"), "ENOSPC reservation lost");
+        check(fs::exists(f.c.path + "/clock.json"), "ENOSPC clock watermark lost");
         std::cout << "Near-full filesystem preflight and cleanup gate passed on dedicated bounded tmpfs\n";
         return 0;
     }
@@ -151,13 +151,12 @@ int main(int argc, char ** argv) {
         d.save(a); check(f.files() == 0, "expired RAM snapshot must not restart TTL");
     }
     {
-        fixture f; f.c.write_bytes = 7000; auto a = state(10);
-        { server_cache_disk d(f.c); d.save(a); check(f.files() == 1, "budget initial"); }
-        { server_cache_disk d(f.c); d.save(state(100)); check(f.files() == 1, "budget restart"); }
+        fixture f; auto a = state(10); server_prompt_cache_state out;
+        { server_cache_disk d(f.c); d.save(a); check(f.files() == 1, "clock initial"); }
         f.time -= 1000;
-        { server_cache_disk d(f.c); d.save(state(100)); check(f.files() == 1, "budget rollback"); }
-        f.time += 87401;
-        { server_cache_disk d(f.c); d.save(state(100)); check(f.files() == 1, "budget renewal"); }
+        { server_cache_disk d(f.c); check(d.load(out, a.prompt.tokens, 0), "clock rollback after restart"); }
+        f.time += 1101;
+        { server_cache_disk d(f.c); check(!d.load(out, a.prompt.tokens, 0), "clock expiry after restart"); }
     }
     {
         fixture f; f.c.max_bytes = 78000; auto a = state(10), b = state(100), c = state(200);
@@ -188,8 +187,8 @@ int main(int argc, char ** argv) {
     {
         fixture f; f.c.free_bytes = 1ull << 62;
         { server_cache_disk d(f.c); d.save(state(10)); check(f.files() == 0, "free-space floor"); }
-        f.c.free_bytes = 0; f.c.write_bytes = 7000;
-        { server_cache_disk d(f.c); d.save(state(10)); check(f.files() == 0, "failed writes stay charged"); }
+        f.c.free_bytes = 0;
+        { server_cache_disk d(f.c); d.save(state(10)); check(f.files() == 1, "capacity recovery after failed write"); }
     }
     {
         fixture f;
@@ -201,15 +200,15 @@ int main(int argc, char ** argv) {
     }
     {
         fixture f;
-        std::ofstream(f.path + "/budget.json") << "truncated"; chmod((f.path + "/budget.json").c_str(), 0600);
+        std::ofstream(f.path + "/clock.json") << "truncated"; chmod((f.path + "/clock.json").c_str(), 0600);
         expect_disabled(f.c);
     }
     {
         fixture f; { server_cache_disk d(f.c); d.save(state(10)); }
-        fs::remove(f.path + "/budget.json"); expect_disabled(f.c);
+        fs::remove(f.path + "/clock.json"); expect_disabled(f.c);
     }
     {
-        fixture f; f.c.max_bytes = 1000000; f.c.write_bytes = 1000000;
+        fixture f; f.c.max_bytes = 1000000;
         server_cache_disk d(f.c); server_prompt_cache_state out;
         for (int i = 0; i < 70; ++i) { d.save(state(i * 1000)); }
         check(f.files() == 64, "entry count cap");
@@ -224,7 +223,7 @@ int main(int argc, char ** argv) {
         d.save(state(10)); check(f.files() == 1, "read-only recovery");
     }
     {
-        fixture f; f.c.write_bytes = 12000;
+        fixture f;
         struct rlimit old{}, small{};
         check(getrlimit(RLIMIT_FSIZE, &old) == 0, "getrlimit");
         small = old; small.rlim_cur = 4096;
@@ -234,8 +233,8 @@ int main(int argc, char ** argv) {
           d.save(state(10));
           check(setrlimit(RLIMIT_FSIZE, &old) == 0, "restore rlimit");
           check(f.files() == 0 && !fs::exists(f.path + "/.entry.tmp"), "partial write cleanup"); }
-        { server_cache_disk d(f.c); d.save(state(100)); check(f.files() == 1, "partial write reservation recovery");
-          d.save(state(200)); check(f.files() == 1, "partial write reservation retained"); }
+        { server_cache_disk d(f.c); d.save(state(100)); check(f.files() == 1, "partial write recovery");
+          d.save(state(200)); check(f.files() == 2, "no daily write limit after recovery"); }
     }
-    std::cout << "SSD policy gates passed: admission, roundtrip, dedup, restart, identity, TTL, budget persistence/rollback/renewal, LRU, checksum, truncation, permissions, free-space, crash reservation, orphan, lock, foreign files, corrupt ledger\n";
+    std::cout << "SSD policy gates passed: admission, roundtrip, dedup, restart, identity, TTL, clock rollback/expiry, LRU, checksum, truncation, permissions, free-space, interrupted write recovery, orphan, lock, foreign files, corrupt clock\n";
 }
