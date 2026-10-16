@@ -1852,7 +1852,12 @@ private:
             const size_t live = ret->prompt.tokens.get_common_prefix(task.tokens);
             // Reprocessing one prompt batch is cheaper than decoding a multi-GiB
             // record, and must not queue behind a background save.
-            if (live >= 8192 && task.tokens.size() - live <= llama_n_batch(ctx_tgt)) { task.cache_checked = true; }
+            if (live >= 8192 && task.tokens.size() - live <= llama_n_batch(ctx_tgt)) {
+                // A different request may have warmed this prefix while our
+                // read was pending. Release that read's owned RAM as well.
+                prompt_cache->disk->cancel(task.id);
+                task.cache_checked = true;
+            }
             bool restore = prompt_cache->best_prefix(task.tokens, live) > live;
             const bool busy = std::any_of(slots.begin(), slots.end(), [](const auto & slot) { return slot.is_processing(); });
             if (!task.cache_checked && task.tokens.size() >= 8192) {
@@ -1862,9 +1867,12 @@ private:
                     return nullptr;
                 }
                 if (phase == server_cache_async::status::pending) { return nullptr; }
-                if (phase == server_cache_async::status::ready && busy) { return nullptr; }
+                const size_t current = prompt_cache->best_prefix(task.tokens, live);
+                const bool improves = prompt_cache->disk->result_prefix(task.id, task.tokens) > current;
+                if (phase == server_cache_async::status::ready && improves && busy) { return nullptr; }
                 auto state = prompt_cache->disk->take(task.id);
-                if (state) { prompt_cache->states.push_back(std::move(state)); restore = true; }
+                if (state && improves) { prompt_cache->states.push_back(std::move(state)); }
+                restore = prompt_cache->best_prefix(task.tokens, live) > live;
                 task.cache_checked = true;
             }
             if (restore) {

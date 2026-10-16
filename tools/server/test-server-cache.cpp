@@ -106,6 +106,7 @@ int main(int argc, char ** argv) {
         d.grant_memory(id);
         while ((phase = d.poll(id, a->prompt.tokens, 0)) != server_cache_async::status::ready && std::chrono::steady_clock::now() < until) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); }
         check(phase == server_cache_async::status::ready && d.memory_reserved(), "ready state remains charged");
+        check(d.result_prefix(id, a->prompt.tokens) == a->prompt.tokens.size(), "revalidate prepared prefix before GPU apply");
         auto loaded = d.take(id);
         check(loaded && loaded->data.main == a->data.main && !d.memory_reserved(), "async immutable roundtrip");
         phase = d.poll(3, a->prompt.tokens, 0);
@@ -114,7 +115,13 @@ int main(int argc, char ** argv) {
         d.cancel(3);
         while (d.poll(4, a->prompt.tokens, 0) == server_cache_async::status::pending && std::chrono::steady_clock::now() < until) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); }
         check(d.poll(4, a->prompt.tokens, 0) == server_cache_async::status::memory, "cancel releases reader without retiring record");
-        d.cancel(4); check(wakes > 0, "worker wakes scheduler");
+        d.grant_memory(4);
+        while (d.poll(4, a->prompt.tokens, 0) != server_cache_async::status::ready && std::chrono::steady_clock::now() < until) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); }
+        const int prior_wakes = wakes;
+        d.cancel(4);
+        check(!d.memory_reserved() && wakes > prior_wakes, "obsolete prepared result releases RAM and wakes waiters");
+        check(d.poll(5, a->prompt.tokens, 0) == server_cache_async::status::pending, "later reader admitted after prepared cancellation");
+        d.cancel(5);
     }
     {
         fixture f; auto a = state(10); server_prompt_cache_state out;
