@@ -2696,7 +2696,7 @@ static bool ggml_cuda_graph_debug_enabled() {
     return enabled;
 }
 
-static ggml_cuda_graph * ggml_cuda_graph_get(ggml_backend_cuda_context * cuda_ctx, const void * key) {
+static size_t ggml_cuda_graph_cache_capacity() {
     static const size_t capacity = []() -> size_t {
         const char * value = getenv("GGML_CUDA_GRAPH_CACHE_CAPACITY");
         if (!value) { return 8; }
@@ -2709,23 +2709,66 @@ static ggml_cuda_graph * ggml_cuda_graph_get(ggml_backend_cuda_context * cuda_ct
         return size_t(n);
     }();
 
+    return capacity;
+}
+
+static ggml_cuda_graph * ggml_cuda_graph_get(ggml_backend_cuda_context * cuda_ctx, const void * key) {
     auto & cache = cuda_ctx->cuda_graphs;
-    if (cache.find(key) == cache.end() && cache.size() >= capacity) {
-        // Reclaim executable memory before another capture. Never evict the graph currently being evaluated.
+    const size_t metadata_capacity = std::max(size_t(16), ggml_cuda_graph_cache_capacity());
+    if (cache.find(key) == cache.end() && cache.size() >= metadata_capacity) {
         ggml_cuda_set_device(cuda_ctx->device);
         CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
-        while (cache.size() >= capacity) {
+        while (cache.size() >= metadata_capacity) {
             auto oldest = cache.begin();
             for (auto it = cache.begin(); it != cache.end(); ++it) {
                 if (it->second->last_used_time < oldest->second->last_used_time) {
                     oldest = it;
                 }
             }
-            GGML_LOG_DEBUG("%s: evicting least recently used CUDA graph (%zu/%zu)\n", __func__, cache.size(), capacity);
             cache.erase(oldest);
         }
     }
     return cuda_ctx->cuda_graph(key);
+}
+
+static void ggml_cuda_graph_reserve(ggml_backend_cuda_context * cuda_ctx, const void * key) {
+    auto & cache = cuda_ctx->cuda_graphs;
+    const size_t capacity = ggml_cuda_graph_cache_capacity();
+    size_t resident = 0;
+    for (const auto & entry : cache) {
+        resident += entry.second->instance != nullptr || entry.second->graph != nullptr;
+    }
+    const auto & current = cache.at(key);
+    const bool already_resident = current->instance != nullptr || current->graph != nullptr;
+    if (resident + !already_resident <= capacity) {
+        return;
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    while (resident + !already_resident > capacity) {
+        auto oldest = cache.end();
+        for (auto it = cache.begin(); it != cache.end(); ++it) {
+            if (it->first != key && (it->second->instance != nullptr || it->second->graph != nullptr) &&
+                (oldest == cache.end() || it->second->last_used_time < oldest->second->last_used_time)) {
+                oldest = it;
+            }
+        }
+        GGML_ASSERT(oldest != cache.end());
+        auto & graph = *oldest->second;
+        if (graph.instance != nullptr) {
+            CUDA_CHECK(cudaGraphExecDestroy(graph.instance));
+            graph.instance = nullptr;
+        }
+        if (graph.graph != nullptr) {
+            CUDA_CHECK(cudaGraphDestroy(graph.graph));
+            graph.graph = nullptr;
+        }
+        graph.nodes.clear();
+        graph.num_nodes = 0;
+        // Keep the fingerprint and warmup state so reuse recaptures without another eager evaluation.
+        GGML_LOG_DEBUG("%s: evicting least recently used CUDA graph (%zu/%zu)\n", __func__, resident, capacity);
+        --resident;
+    }
 }
 
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
@@ -4857,6 +4900,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #endif // USE_CUDA_GRAPH
 
     if (use_cuda_graph && cuda_graph_update_required) {
+#ifdef USE_CUDA_GRAPH
+        ggml_cuda_graph_reserve(cuda_ctx, graph_key);
+#endif
         // Start CUDA graph capture
         {
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);

@@ -308,10 +308,12 @@ Legal values: `auto`, `f16`, `fp16`, `bf16`, `f32`, `fp32`.
 
 #### GGML_CUDA_GRAPH_CACHE_CAPACITY
 
-Maximum CUDA graphs retained per backend context, from 1 to 128 (default: 8).
-New graph keys evict the least recently used entry when the cache is full.
-Eviction waits for the backend stream before freeing executable memory. Lower
-values reduce retained graph memory but may increase capture and warmup work.
+Maximum resident CUDA graphs per backend context, from 1 to 128 (default: 8).
+A capture evicts the least recently used resident graph when the cache is full.
+Eviction waits for the backend stream before freeing executable memory, retaining
+the fingerprint and warmup state for recapture. CPU metadata is bounded to the
+larger of 16 entries or this capacity, with the existing unused-entry expiry.
+Lower values reduce retained graph memory but may increase capture work.
 This bounds the number of cached graphs, not total VRAM or a single graph's size.
 
 #### GGML_CUDA_MMQ_PREC
