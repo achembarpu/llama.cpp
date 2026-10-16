@@ -106,7 +106,6 @@ struct server_cache_disk::impl {
     fd_owner lock;
     bool enabled = true;
     int64_t high_time = 0;
-    json reservations = json::array();
     std::string last_loaded;
     struct entry {
         std::string name;
@@ -139,9 +138,8 @@ struct server_cache_disk::impl {
         }
     }
 
-    void ledger() {
-        require(reservations.size() <= 256, "too many write reservations");
-        atomic_small("budget.json", json{{"version", 1}, {"time", high_time}, {"writes", reservations}}.dump());
+    void save_clock() {
+        atomic_small("clock.json", json{{"version", 1}, {"time", high_time}}.dump());
     }
 
     void forget(std::list<entry>::iterator it) {
@@ -227,31 +225,25 @@ struct server_cache_disk::impl {
         lock = openat(dir, ".lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
         require(private_file(lock, 0) && flock(lock, LOCK_EX | LOCK_NB) == 0, "SSD directory already locked or unsafe lock");
         // Discard only our two incomplete temporary files, under the lock.
-        for (const char * tmp : {".entry.tmp", ".budget.json.tmp"}) {
+        for (const char * tmp : {".entry.tmp", ".clock.json.tmp"}) {
             struct stat s{};
             if (fstatat(dir, tmp, &s, AT_SYMLINK_NOFOLLOW) == 0) {
                 require(S_ISREG(s.st_mode) && s.st_uid == geteuid(), "unsafe orphan temporary file");
                 require(unlinkat(dir, tmp, 0) == 0, "orphan cleanup failed");
             }
         }
-        fd_owner budget(openat(dir, "budget.json", O_RDONLY | O_NOFOLLOW | O_CLOEXEC));
-        const bool had_budget = budget.fd >= 0;
-        if (budget.fd >= 0) {
-            require(private_file(budget.fd, metadata_reserve / 2), "unsafe budget file");
-            struct stat s{}; fstat(budget.fd, &s);
+        fd_owner clock(openat(dir, "clock.json", O_RDONLY | O_NOFOLLOW | O_CLOEXEC));
+        const bool had_clock = clock.fd >= 0;
+        if (clock.fd >= 0) {
+            require(private_file(clock.fd, metadata_reserve / 2), "unsafe clock file");
+            struct stat s{}; fstat(clock.fd, &s);
             std::string bytes(s.st_size, '\0');
-            if (!bytes.empty()) { transfer(budget.fd, &bytes[0], bytes.size(), false); }
+            if (!bytes.empty()) { transfer(clock.fd, &bytes[0], bytes.size(), false); }
             const auto b = json::parse(bytes);
-            require(b.at("version") == 1, "incompatible budget");
+            require(b.at("version") == 1, "incompatible clock");
             high_time = b.at("time").get<int64_t>();
-            reservations = b.at("writes");
-            require(reservations.is_array() && reservations.size() <= 256, "invalid write ledger");
-            for (const auto & w : reservations) {
-                require(w.at(0).get<int64_t>() > 0 && w.at(0).get<int64_t>() <= high_time &&
-                    w.at(1).is_number_integer() && w.at(1).get<int64_t>() >= 0 &&
-                    w.at(1).get<uint64_t>() <= c.write_bytes, "invalid reservation");
-            }
-        } else { require(errno == ENOENT, "budget unavailable"); }
+            require(high_time > 0, "invalid clock watermark");
+        } else { require(errno == ENOENT, "clock unavailable"); }
         now();
         fd_owner scan_fd(dup(dir));
         DIR * scan = fdopendir(dup(scan_fd.fd));
@@ -262,9 +254,9 @@ struct server_cache_disk::impl {
                 auto * item = readdir(scan);
                 if (!item) { require(errno == 0, "directory read failed"); break; }
                 const std::string name = item->d_name;
-                if (name == "." || name == ".." || name == ".lock" || name == "budget.json") { continue; }
+                if (name == "." || name == ".." || name == ".lock" || name == "clock.json") { continue; }
                 require(entry_name(name), "cache directory contains an unrecognized file");
-                require(had_budget, "entries exist without their persistent write budget");
+                require(had_clock, "entries exist without their persistent clock watermark");
                 fd_owner in(openat(dir, name.c_str(), O_RDONLY | O_NOFOLLOW | O_NOATIME | O_CLOEXEC));
                 require(private_file(in.fd, c.max_bytes), "unsafe cache file");
                 struct stat s{}; fstat(in.fd, &s);
@@ -286,7 +278,7 @@ struct server_cache_disk::impl {
             auto oldest = std::min_element(entries.begin(), entries.end(), [](const entry & a, const entry & b) { return a.used < b.used; });
             forget(oldest);
         }
-        ledger();
+        save_clock();
         SRV_INF("SSD cache enabled: %zu entries, %.3f MiB, TTL %lld s\n", entries.size(), size() / 1048576.0, (long long)c.ttl_seconds);
     }
 
@@ -311,24 +303,9 @@ struct server_cache_disk::impl {
             }
             const std::string header = h.dump();
             require(header.size() <= max_header, "header too large");
-            // Reserve the incompressible bound before writing. Settle to actual
-            // bytes only after publication; interrupted attempts stay charged.
+            // Reserve enough capacity for an incompressible record and retain the TTL watermark across restarts.
             const uint64_t bound = 8 + header.size() + ZSTD_compressBound(state.size()) + 32;
-            json recent = json::array();
-            uint64_t spent = 0;
-            for (const auto & w : reservations) {
-                if (w.at(0).get<int64_t>() > t - 86400) {
-                    const uint64_t n = w.at(1).get<uint64_t>();
-                    require(n <= c.write_bytes - std::min(spent, c.write_bytes), "write ledger overflow");
-                    spent += n; recent.push_back(w);
-                }
-            }
-            reservations = std::move(recent);
-            require(bound <= c.write_bytes - spent && reservations.size() < 256, "rolling-day write cap");
-            // Reserve durably before attempting data writes, including failures
-            // or crashes. Restart and clock rollback cannot reset the budget.
-            reservations.push_back(json::array({t, bound}));
-            ledger();
+            save_clock();
             make_room(bound);
             fd_owner out(openat(dir, ".entry.tmp", O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
             require(out.fd >= 0, "entry temporary file failed");
@@ -369,8 +346,6 @@ struct server_cache_disk::impl {
             require(renameat(dir, ".entry.tmp", dir, name.c_str()) == 0, "entry rename failed");
             published = true;
             sync_dir();
-            reservations.back().at(1) = bytes;
-            ledger();
             entries.push_back({name, std::move(h), state.prompt.tokens.clone(), bytes, t});
             // Only retire a shorter prefix after its replacement is durable.
             for (auto it = entries.begin(); it != std::prev(entries.end());) {

@@ -13,8 +13,7 @@ struct server_tokens;
 struct server_cache_disk_config {
     std::string path;
     std::string identity;
-    uint64_t max_bytes = 32ull << 30;
-    uint64_t write_bytes = 16ull << 30;
+    uint64_t max_bytes = 128ull << 30;
     uint64_t free_bytes = 2ull << 30;
     int64_t ttl_seconds = 14 * 86400;
     size_t min_tokens = 8192;
