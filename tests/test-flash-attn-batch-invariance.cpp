@@ -79,10 +79,13 @@ int main() {
         size_t passed = 0, total = 0;
         for (int64_t tail : {0, 256}) {
             for (int64_t d : {256, 512}) {
-                for (int64_t n : {2, 3, 8, 17, 128}) {
-                    for (int64_t row : {int64_t(0), n - 1}) {
-                        passed += check(backend, d, d == 256 ? 8 : 1, d == 256 ? 2 : 16, d == 256 ? 1536 : 4608, n, row, tail);
-                        ++total;
+                const std::vector<int64_t> depths = d == 256 ? std::vector<int64_t>{1536} : std::vector<int64_t>{4096, 4608, 8192};
+                for (int64_t kv : depths) {
+                    for (int64_t n : {2, 3, 8, 17, 128}) {
+                        for (int64_t row : {int64_t(0), n - 1}) {
+                            passed += check(backend, d, d == 256 ? 8 : 1, d == 256 ? 2 : 16, kv, n, row, tail);
+                            ++total;
+                        }
                     }
                 }
             }
