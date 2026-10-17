@@ -9,6 +9,8 @@
 #include "../src/unicode.h"
 #include "../tools/server/server-chat.h"
 #include "chat-auto-parser.h"
+#include "chat-peg-parser.h"
+#include "json-schema-to-grammar.h"
 #include "chat.h"
 #include "common.h"
 #include "ggml.h"
@@ -8008,6 +8010,35 @@ static void test_qwen_string_literals() {
     }
 }
 
+static void test_required_tag_json_prefix() {
+    autoparser::analyze_tools tools;
+    tools.format.mode = autoparser::tool_format::TAG_WITH_JSON;
+    tools.format.per_call_start = "<tool_call>";
+    tools.format.per_call_end = "</tool_call>";
+    tools.function.name_prefix = "<function=";
+    tools.function.name_suffix = ">";
+    tools.function.close = "</function>";
+    for (auto choice : { COMMON_CHAT_TOOL_CHOICE_AUTO, COMMON_CHAT_TOOL_CHOICE_REQUIRED }) {
+        autoparser::generation_params inputs;
+        inputs.tools = common_chat_tools_to_json_oaicompat({ special_function_tool });
+        inputs.tool_choice = choice;
+        auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+            autoparser::parser_build_context ctx(p, inputs);
+            return tools.build_parser(ctx);
+        });
+        auto gbnf = ::build_grammar([&](const common_grammar_builder & builder) { parser.build_grammar(builder); });
+        const std::string call = "<tool_call><function=special_function>{\"arg1\":1}</function></tool_call>";
+        for (const std::string prefix : { "", "Here is the call: " }) {
+            const std::string wire = prefix + call;
+            auto grammar = build_grammar(gbnf);
+            assert_equals(choice == COMMON_CHAT_TOOL_CHOICE_AUTO || prefix.empty(),
+                          match_string(wire, grammar.get()));
+            common_peg_parse_context ctx(wire);
+            assert_equals(true, parser.parse(ctx).success());
+        }
+    }
+}
+
 int main(int argc, char ** argv) {
     bool detailed_debug    = false;
     bool only_run_filtered = false;
@@ -8032,6 +8063,9 @@ int main(int argc, char ** argv) {
 
     if (g_template_filter.empty() || g_template_filter.find("Qwen") != std::string::npos) {
         test_qwen_string_literals();
+    }
+    if (g_template_filter.empty() || g_template_filter.find("MiMo") != std::string::npos) {
+        test_required_tag_json_prefix();
     }
 
     if (only_run_filtered) {

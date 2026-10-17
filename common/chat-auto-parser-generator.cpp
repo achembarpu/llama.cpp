@@ -353,7 +353,12 @@ common_peg_parser analyze_tools::build_tool_parser_tag_json(parser_build_context
 
     std::string trigger_marker       = !format.section_start.empty() ? format.section_start : format.per_call_start;
     auto        content_before_tools = trigger_marker.empty() ? p.eps() : p.until(trigger_marker);
-    return ctx.reasoning_parser + p.optional(p.content(content_before_tools)) + tool_calls + p.end();
+    auto content_prefix = p.optional(p.content(content_before_tools));
+    if (require_calls) {
+        // Keep parsing existing prose, but force generation to enter the required call.
+        content_prefix = p.gbnf(content_prefix, "\"\"");
+    }
+    return ctx.reasoning_parser + content_prefix + tool_calls + p.end();
 }
 
 common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_context & ctx) const {
