@@ -11546,6 +11546,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {4, 1}, 1024, 6, true, false, 0,  0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, 1024, 5, true, true,  0,  0, GGML_PREC_F32, type_KV, type_KV));
     }
+    for (ggml_type type_KV : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        for (int kv : {1024, 4096}) {
+            for (int nb : {16, 32, 64, 128}) {
+                test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {16, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            }
+        }
+    }
 
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {

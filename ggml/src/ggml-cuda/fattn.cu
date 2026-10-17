@@ -5,6 +5,7 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+#include <climits>
 #include <cstdlib>
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -293,9 +294,32 @@ static int ggml_cuda_fattn_mma_q_nb_min() {
     return nb_min;
 }
 
-static int ggml_cuda_fattn_mma_q_nb_max() {
-    static const int nb_max = getenv("FA_Q_MMA") ? std::min(atoi(getenv("FA_Q_MMA")), 8) : 8;
-    return nb_max;
+static int ggml_cuda_fattn_mma_q_nb_max(bool full_query_tile) {
+    static const int nb_max = getenv("FA_Q_MMA") ? atoi(getenv("FA_Q_MMA")) : INT_MAX;
+    return full_query_tile ? nb_max : std::min(nb_max, 8);
+}
+
+static int ggml_cuda_fattn_mma_q_ncols2(const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * mask = dst->src[3];
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    for (const ggml_tensor * t : {Q, mask}) {
+        for (size_t i = 1; t && i < GGML_MAX_DIMS; ++i) {
+            if (t->nb[i] % 16 != 0) {
+                use_gqa_opt = false;
+                break;
+            }
+        }
+    }
+    int ncols2 = 1;
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+    while (use_gqa_opt && ncols2 < 8 && gqa_ratio % (2*ncols2) == 0) {
+        ncols2 *= 2;
+    }
+    return ncols2;
 }
 
 // quantized K/V that the MMA kernel can dequantize on the fly instead of converting all of K/V to f16 first
@@ -317,13 +341,19 @@ static bool ggml_cuda_fattn_mma_use_q(const int cc, const ggml_tensor * dst) {
     if (K->ne[0] <= 256 && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[1] <= 4) {
         return false;
     }
-    return Q->ne[1] >= ggml_cuda_fattn_mma_q_nb_min() && Q->ne[1] <= ggml_cuda_fattn_mma_q_nb_max();
+    const int ncols2 = ggml_cuda_fattn_mma_q_ncols2(dst);
+    if (K->ne[0] == 512 && ncols2 == 1) {
+        return false;
+    }
+    // The 512-wide global tile already iterates over arbitrary query counts.
+    const bool full_query_tile = K->ne[0] == 512 && ncols2 == 8;
+    return Q->ne[1] >= ggml_cuda_fattn_mma_q_nb_min() && Q->ne[1] <= ggml_cuda_fattn_mma_q_nb_max(full_query_tile);
 }
 
 template <int D, ggml_type type_KV>
 static void ggml_cuda_flash_attn_ext_mma_q_switch_ncols(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int ncols2) {
     const int64_t nb = dst->src[0]->ne[1];
-    GGML_ASSERT(nb <= 8);
+    GGML_ASSERT(nb <= 8 || (D == 512 && ncols2 == 8));
 
     switch (ncols2) {
         case 1:
@@ -376,25 +406,8 @@ static void ggml_cuda_flash_attn_ext_mma_q_switch_D(ggml_backend_cuda_context & 
 }
 
 static void ggml_cuda_flash_attn_ext_mma_q(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
-    const ggml_tensor * mask = dst->src[3];
-
-    float max_bias = 0.0f;
-    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
-
-    // same GQA selection as ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2
-    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
-    for (const ggml_tensor * t : {Q, mask}) {
-        for (size_t i = 1; t && i < GGML_MAX_DIMS; ++i) {
-            if (t->nb[i] % 16 != 0) {
-                use_gqa_opt = false;
-                break;
-            }
-        }
-    }
-    const int gqa_ratio = Q->ne[2] / K->ne[2];
-    const int ncols2 = !use_gqa_opt ? 1 : (gqa_ratio > 4 ? 8 : (gqa_ratio > 2 ? 4 : (gqa_ratio > 1 ? 2 : 1)));
+    const int ncols2 = ggml_cuda_fattn_mma_q_ncols2(dst);
 
     if (K->type == GGML_TYPE_Q8_0) {
         ggml_cuda_flash_attn_ext_mma_q_switch_D<GGML_TYPE_Q8_0>(ctx, dst, ncols2);
