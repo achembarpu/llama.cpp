@@ -62,6 +62,27 @@ static void expect_disabled(const server_cache_disk_config & c) {
     check(failed, "unsafe cache was accepted");
 }
 int main(int argc, char ** argv) {
+    for (const size_t count : {131073u, 262144u}) {
+        fixture f;
+        f.c.max_tokens = 262144;
+        f.c.max_bytes = 4 * 1024 * 1024;
+        auto a = state(10, count);
+        a.prompt.tokens = server_tokens(llama_tokens(count, 262143), false);
+        { server_cache_disk d(f.c); d.save(a); check(f.files() == 1, "large token key save"); }
+        server_cache_disk d(f.c);
+        server_prompt_cache_state restored;
+        check(d.load(restored, a.prompt.tokens, 0), "large token key restart");
+        check(restored.prompt.tokens.get_text_tokens() == a.prompt.tokens.get_text_tokens() &&
+              restored.data.main == a.data.main && restored.data.drft == a.data.drft &&
+              restored.prompt.checkpoints.size() == 1 &&
+              restored.prompt.checkpoints.front().pos_max == a.prompt.checkpoints.front().pos_max &&
+              restored.prompt.checkpoints.front().data_tgt == a.prompt.checkpoints.front().data_tgt &&
+              restored.prompt.checkpoints.front().data_dft == a.prompt.checkpoints.front().data_dft &&
+              restored.prompt.checkpoints.front().data_spec == a.prompt.checkpoints.front().data_spec,
+              "large token key payload and checkpoint roundtrip");
+        d.save(state(20, 262145));
+        check(f.files() == 1, "over-context token key rejected");
+    }
     {
         server_prompt_cache cache(1, 0);
         auto a = state(10), b = state(100);
