@@ -291,6 +291,8 @@ endif()
 llama_build(test-backend-ops.cpp)
 
 llama_build_and_test(test-tiled-mulmat.cpp)
+llama_build_and_test(test-kv-cache-prepare.cpp)
+target_include_directories(test-kv-cache-prepare PRIVATE ../src)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
