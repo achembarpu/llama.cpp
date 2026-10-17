@@ -11754,6 +11754,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096, 4, true, false, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
 
     // flash attention over a list of K/V rows per slice (unified KV cache)
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        for (int64_t nb : {1, 3, 8, 64, 128}) {
+            for (int64_t n_slices : {1, 2, 4}) {
+                test_cases.emplace_back(new test_flash_attn_ext_kv_rows(512, 1, 16, 4096, 1024, nb, n_slices, type));
+                test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 8, 2, 4096, 1024, nb, n_slices, type));
+            }
+        }
+    }
     for (int64_t nb : {1, 3, 8, 64, 512}) {
         for (int64_t n_slices : {1, 4}) {
             test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 2, 8, 4096, 1024, nb, n_slices));

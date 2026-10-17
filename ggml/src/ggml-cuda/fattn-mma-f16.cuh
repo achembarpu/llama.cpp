@@ -495,7 +495,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
 template<ggml_type type_KV, int stride_tile, int nwarps, int nbatch_fa, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_q(
         const char * const __restrict__ KV, half2 * const __restrict__ tile_KV, const int D2, const int stride_KV,
-        const int k0, const int k_VKQ_0, const int i_sup) {
+        const int k0, const int k_VKQ_0, const int i_sup, const int32_t * const __restrict__ indices) {
     static_assert(type_KV == GGML_TYPE_Q4_0 || type_KV == GGML_TYPE_Q8_0, "unsupported type_KV");
     constexpr int warp_size    = ggml_cuda_get_physical_warp_size();
     constexpr int h2_per_chunk = 4;
@@ -515,13 +515,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_q(
 
         half2 tmp[h2_per_chunk] = {{0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}};
         if (!oob_check || i < i_sup) {
-            const char * row = KV + int64_t(k_VKQ_0 + i)*stride_KV;
-            const int    e0  = 2*(k0 + k*h2_per_chunk);
-            if constexpr (type_KV == GGML_TYPE_Q8_0) {
-                dequantize_V_q8_0<half, 8>(row, tmp, e0);
-            } else {
-                dequantize_V_q4_0<half, 4>(row, tmp + 0, e0 + 0);
-                dequantize_V_q4_0<half, 4>(row, tmp + 2, e0 + 4);
+            const int64_t row_index = indices ? indices[k_VKQ_0 + i] : k_VKQ_0 + i;
+            if (row_index >= 0) {
+                const char * row = KV + row_index*stride_KV;
+                const int    e0  = 2*(k0 + k*h2_per_chunk);
+                if constexpr (type_KV == GGML_TYPE_Q8_0) {
+                    dequantize_V_q8_0<half, 8>(row, tmp, e0);
+                } else {
+                    dequantize_V_q4_0<half, 4>(row, tmp + 0, e0 + 0);
+                    dequantize_V_q4_0<half, 4>(row, tmp + 2, e0 + 4);
+                }
             }
         }
         ggml_cuda_memcpy_1<16>(swizzle<stride_tile>(tile_KV, i*stride_tile + k*h2_per_chunk, i), tmp);
@@ -705,7 +708,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 }
             } else {
                 flash_attn_ext_f16_load_tile_q<type_KV, stride_tile_K, nwarps, nbatch_fa, oob_check>
-                    ((const char *) K_h2, tile_K, k0_diff, stride_K, k0_start, k_VKQ_0, k_VKQ_sup);
+                    ((const char *) K_h2, tile_K, k0_diff, stride_K, k0_start, k_VKQ_0, k_VKQ_sup, indices);
             }
             __syncthreads();
         }
@@ -1063,7 +1066,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     }
                 } else {
                     flash_attn_ext_f16_load_tile_q<type_KV, stride_tile_V, nwarps, nbatch_fa, oob_check>
-                        ((const char *) V_h2, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_0, k_VKQ_sup);
+                        ((const char *) V_h2, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_0, k_VKQ_sup, indices);
                 }
                 __syncthreads();
             }

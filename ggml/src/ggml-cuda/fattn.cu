@@ -306,9 +306,10 @@ static int ggml_cuda_fattn_mma_q_ncols2(const ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * mask = dst->src[3];
+    const int64_t n_kv = dst->src[5] ? dst->src[5]->ne[0] : K->ne[1];
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
-    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    bool use_gqa_opt = mask && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, mask}) {
         for (size_t i = 1; t && i < GGML_MAX_DIMS; ++i) {
             if (t->nb[i] % 16 != 0) {
