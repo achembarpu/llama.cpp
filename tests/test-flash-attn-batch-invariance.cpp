@@ -6,14 +6,15 @@
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 static bool check(ggml_backend_t backend, int64_t d, int64_t heads_kv, int64_t gqa,
-                  int64_t kv, int64_t n, int64_t row, int64_t tail) {
+                  int64_t kv, int64_t n, int64_t row, int64_t tail, ggml_type type) {
     auto * ctx = ggml_init({8 * 1024 * 1024, nullptr, true});
     auto * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, n, heads_kv * gqa, 1);
-    auto * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, kv + tail, heads_kv, 1);
-    auto * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, kv + tail, heads_kv, 1);
+    auto * k = ggml_new_tensor_4d(ctx, type, d, kv + tail, heads_kv, 1);
+    auto * v = ggml_new_tensor_4d(ctx, type, d, kv + tail, heads_kv, 1);
     auto * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv + tail, n, 1, 1);
     auto * mask_short = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, n, 1, 1);
     for (auto * t : {q, k, v, mask, mask_short}) ggml_set_input(t);
@@ -45,7 +46,7 @@ static bool check(ggml_backend_t backend, int64_t d, int64_t heads_kv, int64_t g
         } else {
             std::vector<uint8_t> data(ggml_nbytes(t));
             if (ggml_quantize_chunk(t->type, values.data(), data.data(), 0, ggml_nrows(t), t->ne[0], nullptr) != data.size()) {
-                throw std::runtime_error("F16 conversion");
+                throw std::runtime_error("cache conversion");
             }
             ggml_backend_tensor_set(t, data.data(), 0, data.size());
         }
@@ -69,8 +70,12 @@ static bool check(ggml_backend_t backend, int64_t d, int64_t heads_kv, int64_t g
     return different == 0;
 }
 
-int main() {
+int main(int argc, char ** argv) {
     try {
+        if (argc > 2) throw std::runtime_error("usage: test-flash-attn-batch-invariance [f16|q4_0|q8_0]");
+        const std::string name = argc == 2 ? argv[1] : "f16";
+        const ggml_type type = name == "f16" ? GGML_TYPE_F16 : name == "q4_0" ? GGML_TYPE_Q4_0 : name == "q8_0" ? GGML_TYPE_Q8_0 : GGML_TYPE_COUNT;
+        if (type == GGML_TYPE_COUNT) throw std::runtime_error("unsupported cache type");
         ggml_backend_load_all();
         auto * dev = ggml_backend_dev_by_name("CUDA0");
         if (!dev) throw std::runtime_error("CUDA0 missing");
@@ -83,7 +88,7 @@ int main() {
                 for (int64_t kv : depths) {
                     for (int64_t n : {2, 3, 8, 17, 128}) {
                         for (int64_t row : {int64_t(0), n - 1}) {
-                            passed += check(backend, d, d == 256 ? 8 : 1, d == 256 ? 2 : 16, kv, n, row, tail);
+                            passed += check(backend, d, d == 256 ? 8 : 1, d == 256 ? 2 : 16, kv, n, row, tail, type);
                             ++total;
                         }
                     }

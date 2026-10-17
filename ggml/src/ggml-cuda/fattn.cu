@@ -351,6 +351,9 @@ static bool ggml_cuda_fattn_mma_use_q(const int cc, const ggml_tensor * dst) {
     if (K->ne[0] != V->ne[0] || (K->ne[0] != 128 && K->ne[0] != 256 && K->ne[0] != 512)) {
         return false;
     }
+    if (ggml_cuda_fattn_batch_invariant(cc, dst)) {
+        return true;
+    }
     // Keep the batch-stable quantized vector path for the smaller heads.
     if (K->ne[0] <= 256 && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[1] <= 4) {
         return false;
@@ -367,6 +370,18 @@ static bool ggml_cuda_fattn_mma_use_q(const int cc, const ggml_tensor * dst) {
 template <int D, ggml_type type_KV>
 static void ggml_cuda_flash_attn_ext_mma_q_switch_ncols(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int ncols2) {
     const int64_t nb = dst->src[0]->ne[1];
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (ggml_cuda_fattn_batch_invariant(cc, dst)) {
+        if constexpr (D == 256) {
+            GGML_ASSERT(ncols2 == 2);
+            ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 4, 2, type_KV>(ctx, dst);
+            return;
+        } else if constexpr (D == 512) {
+            GGML_ASSERT(ncols2 == 8);
+            ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 4, 8, type_KV>(ctx, dst);
+            return;
+        }
+    }
     GGML_ASSERT(nb <= 8 || (D == 512 && ncols2 == 8));
 
     switch (ncols2) {
@@ -783,6 +798,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     if (mask && mask->ne[2] != 1) {
         return BEST_FATTN_KERNEL_NONE;
+    }
+
+    if (ggml_is_quantized(K->type) && ggml_cuda_fattn_batch_invariant(cc, dst)) {
+        return BEST_FATTN_KERNEL_MMA_F16;
     }
 
     // only the MMA kernel reads K/V through kv_rows

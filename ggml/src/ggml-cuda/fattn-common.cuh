@@ -23,9 +23,32 @@ static bool ggml_cuda_fattn_batch_invariant(const int cc, const ggml_tensor * ds
         const char * value = getenv("GGML_CUDA_ATTN_BATCH_INVARIANT");
         return value && atoi(value) != 0;
     }();
-    return enabled && cc >= GGML_CUDA_CC_AMPERE && cc < GGML_CUDA_CC_ADA_LOVELACE &&
-        (dst->src[0]->ne[0] == 256 || dst->src[0]->ne[0] == 512) &&
-        dst->src[1]->type == GGML_TYPE_F16 && dst->src[2]->type == GGML_TYPE_F16;
+    if (!enabled || cc < GGML_CUDA_CC_AMPERE || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
+        return false;
+    }
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    if (q->ne[0] != 256 && q->ne[0] != 512) {
+        return false;
+    }
+    if (k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16) {
+        return true;
+    }
+    const ggml_tensor * mask = dst->src[3];
+    if (k->type != v->type || (k->type != GGML_TYPE_Q4_0 && k->type != GGML_TYPE_Q8_0) ||
+            !mask || k->ne[0] != v->ne[0] || k->ne[1] % FATTN_KQ_STRIDE != 0 ||
+            q->ne[2] != k->ne[2] * (q->ne[0] == 256 ? 2 : 16) || ggml_get_op_params_f32(dst, 1) != 0.0f) {
+        return false;
+    }
+    for (const ggml_tensor * t : {q, mask}) {
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+            if (t->nb[i] % 16 != 0) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 typedef void (* fattn_kernel_t)(

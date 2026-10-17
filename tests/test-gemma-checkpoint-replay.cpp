@@ -88,8 +88,8 @@ static void dump(llama_context * ctx, int seq, const std::filesystem::path & out
 }
 
 int main(int argc, char ** argv) {
-    if (argc != 5) {
-        std::fprintf(stderr, "usage: %s MODEL PROMPT OUTPUT_DIRECTORY SWA_FULL\n", argv[0]);
+    if (argc < 5 || argc > 6) {
+        std::fprintf(stderr, "usage: %s MODEL PROMPT OUTPUT_DIRECTORY SWA_FULL [f16|q4_0|q8_0]\n", argv[0]);
         return 2;
     }
     try {
@@ -102,7 +102,11 @@ int main(int argc, char ** argv) {
         if (!model) throw std::runtime_error("model");
         auto cp = llama_context_default_params(); cp.n_ctx = 8192; cp.n_batch = 512; cp.n_ubatch = 128;
         cp.n_seq_max = 2; cp.n_threads = cp.n_threads_batch = 6;
-        cp.type_k = cp.type_v = GGML_TYPE_F16; cp.kv_unified = true; cp.swa_full = std::stoi(argv[4]) != 0;
+        const std::string type = argc == 6 ? argv[5] : "f16";
+        cp.type_k = cp.type_v = type == "f16" ? GGML_TYPE_F16 : type == "q4_0" ? GGML_TYPE_Q4_0 :
+                               type == "q8_0" ? GGML_TYPE_Q8_0 : GGML_TYPE_COUNT;
+        if (cp.type_k == GGML_TYPE_COUNT) throw std::runtime_error("unsupported cache type");
+        cp.kv_unified = true; cp.swa_full = std::stoi(argv[4]) != 0;
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
         auto * ctx = llama_init_from_model(model, cp);
         if (!ctx) throw std::runtime_error("context");
