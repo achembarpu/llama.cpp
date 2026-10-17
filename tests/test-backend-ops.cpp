@@ -8366,8 +8366,8 @@ struct test_flash_attn_ext : public test_case {
 struct test_flash_attn_ext_batch_invariance : public test_flash_attn_ext {
     const int64_t row;
 
-    test_flash_attn_ext_batch_invariance(ggml_type type, int64_t kv, int64_t nb, int64_t row)
-        : test_flash_attn_ext(256, 256, 4, {8, 1}, kv, nb, true, false, 0, 0,
+    test_flash_attn_ext_batch_invariance(ggml_type type, int64_t kv, int64_t nb, int64_t row, int64_t seqs, int64_t gqa)
+        : test_flash_attn_ext(256, 256, 4, {gqa, seqs}, kv, nb, true, false, 0, 0,
                               GGML_PREC_F32, type, type), row(row) {}
 
     std::string vars() override {
@@ -8392,12 +8392,13 @@ struct test_flash_attn_ext_batch_invariance : public test_flash_attn_ext {
         ggml_tensor * m = batched->src[3];
         ggml_tensor * q_one = ggml_view_4d(ctx, q, q->ne[0], 1, q->ne[2], q->ne[3],
                                          q->nb[1], q->nb[2], q->nb[3], row*q->nb[1]);
-        ggml_tensor * m_one = ggml_view_4d(ctx, m, m->ne[0], 1, 1, 1,
+        ggml_tensor * m_one = ggml_view_4d(ctx, m, m->ne[0], 1, 1, m->ne[3],
                                          m->nb[1], m->nb[2], m->nb[3], row*m->nb[1]);
+        m_one = ggml_cont(ctx, m_one);
         ggml_tensor * single = ggml_flash_attn_ext(ctx, q_one, batched->src[1], batched->src[2],
                                                  m_one, 1.0f/sqrtf(hsk), 0, 0);
         ggml_prec_set_acc(single, prec);
-        ggml_tensor * selected = ggml_view_4d(ctx, batched, batched->ne[0], batched->ne[1], 1, 1,
+        ggml_tensor * selected = ggml_view_4d(ctx, batched, batched->ne[0], batched->ne[1], 1, batched->ne[3],
                                             batched->nb[1], batched->nb[2], batched->nb[3],
                                             row*batched->nb[2]);
         return ggml_sub(ctx, single, selected);
@@ -8412,9 +8413,11 @@ struct test_flash_attn_ext_batch_invariance : public test_flash_attn_ext {
             const size_t n = ggml_nelements(t);
             std::vector<float> data(n);
             if (strcmp(t->name, "m") == 0) {
-                for (int64_t query = 0; query < nb; ++query) {
-                    for (int64_t key = 0; key < kv; ++key) {
-                        data[query*kv + key] = key <= kv - nb + query ? 0.0f : -INFINITY;
+                for (int64_t seq = 0; seq < t->ne[3]; ++seq) {
+                    for (int64_t query = 0; query < nb; ++query) {
+                        for (int64_t key = 0; key < kv; ++key) {
+                            data[(seq*nb + query)*kv + key] = key <= kv - nb + query ? 0.0f : -INFINITY;
+                        }
                     }
                 }
             } else {
@@ -11717,7 +11720,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t kv : {256, 4096, 4352, 16384, 65536}) {
             for (int64_t nb : {2, 3, 4}) {
                 for (int64_t row : {int64_t(0), nb - 1}) {
-                    test_cases.emplace_back(new test_flash_attn_ext_batch_invariance(type, kv, nb, row));
+                    for (int64_t seqs : {1, 2}) {
+                        for (int64_t gqa : {4, 8}) {
+                            test_cases.emplace_back(new test_flash_attn_ext_batch_invariance(type, kv, nb, row, seqs, gqa));
+                        }
+                    }
                 }
             }
         }

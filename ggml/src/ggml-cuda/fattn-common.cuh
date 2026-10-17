@@ -1193,7 +1193,12 @@ void launch_fattn(
         const bool fixed_quantized_vec_partition = GGML_CUDA_CC_IS_NVIDIA(cc) &&
             cc >= GGML_CUDA_CC_AMPERE && Q->ne[1] <= 4 &&
             (ggml_is_quantized(K->type) || ggml_is_quantized(V->type)) && !need_f16_K && !need_f16_V;
-        if (!fixed_quantized_vec_partition) {
+        if (fixed_quantized_vec_partition) {
+            // Fill one hardware wave even with few KV heads. Keep this independent
+            // of query count, sequence count and padded KV length for replay.
+            const int head_tiles = ntiles_z_gqa * K->ne[2];
+            parallel_blocks = (nsm * max_blocks_per_sm + head_tiles - 1) / head_tiles;
+        } else {
             // parallel_blocks must not be larger than what the tensor size allows:
             parallel_blocks = std::min(parallel_blocks, ntiles_KV);
         }
