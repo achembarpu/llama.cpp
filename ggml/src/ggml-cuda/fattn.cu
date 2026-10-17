@@ -313,6 +313,10 @@ static bool ggml_cuda_fattn_mma_use_q(const int cc, const ggml_tensor * dst) {
     if (K->ne[0] != V->ne[0] || (K->ne[0] != 128 && K->ne[0] != 256 && K->ne[0] != 512)) {
         return false;
     }
+    // Keep the batch-stable quantized vector path for the smaller heads.
+    if (K->ne[0] <= 256 && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[1] <= 4) {
+        return false;
+    }
     return Q->ne[1] >= ggml_cuda_fattn_mma_q_nb_min() && Q->ne[1] <= ggml_cuda_fattn_mma_q_nb_max();
 }
 
