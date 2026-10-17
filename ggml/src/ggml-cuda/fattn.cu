@@ -648,7 +648,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 }
             } else {
                 if (cc >= GGML_CUDA_CC_AMPERE) {
-                    if (Q->ne[1] <= 4) {
+                    if (Q->ne[1] <= 8) {
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 } else {

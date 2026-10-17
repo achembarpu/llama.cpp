@@ -11715,7 +11715,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
         for (int64_t kv : {256, 4096, 4352, 16384, 65536}) {
-            for (int64_t nb : {2, 3, 4}) {
+            for (int64_t nb : {2, 3, 4, 5, 6, 8}) {
                 for (int64_t row : {int64_t(0), nb - 1}) {
                     test_cases.emplace_back(new test_flash_attn_ext_batch_invariance(type, kv, nb, row));
                 }

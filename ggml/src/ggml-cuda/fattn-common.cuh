@@ -1191,7 +1191,7 @@ void launch_fattn(
     } else {
         // Keep the reduction order stable across speculative batch widths.
         const bool fixed_quantized_vec_partition = GGML_CUDA_CC_IS_NVIDIA(cc) &&
-            cc >= GGML_CUDA_CC_AMPERE && Q->ne[1] <= 4 &&
+            cc >= GGML_CUDA_CC_AMPERE && Q->ne[1] <= 8 &&
             (ggml_is_quantized(K->type) || ggml_is_quantized(V->type)) && !need_f16_K && !need_f16_V;
         if (!fixed_quantized_vec_partition) {
             // parallel_blocks must not be larger than what the tensor size allows:
