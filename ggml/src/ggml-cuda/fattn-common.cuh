@@ -18,6 +18,16 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+static bool ggml_cuda_fattn_batch_invariant(const int cc, const ggml_tensor * dst) {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_CUDA_ATTN_BATCH_INVARIANT");
+        return value && atoi(value) != 0;
+    }();
+    return enabled && cc >= GGML_CUDA_CC_AMPERE && cc < GGML_CUDA_CC_ADA_LOVELACE &&
+        (dst->src[0]->ne[0] == 256 || dst->src[0]->ne[0] == 512) &&
+        dst->src[1]->type == GGML_TYPE_F16 && dst->src[2]->type == GGML_TYPE_F16;
+}
+
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -1181,7 +1191,9 @@ void launch_fattn(
         blocks_num.y = 1;
         blocks_num.z = 1;
 
-        if(use_stream_k) {
+        if (ggml_cuda_fattn_batch_invariant(cc, KQV)) {
+            blocks_num.x = ntiles_dst * std::min(8, ntiles_KV);
+        } else if (use_stream_k) {
             const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
             // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
             // Only do this if the occupancy loss from rounding is acceptable.
