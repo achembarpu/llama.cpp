@@ -119,11 +119,12 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
                         }
                         if (literal_schema && literal_schema->kind() == common_chat_schema::KIND_ENUM) {
                             auto values = p.choice();
+                            // Match closers inside each choice so prefixes do not commit early.
                             for (const auto & value : static_cast<const common_chat_schema_enum *>(literal_schema)->values) {
-                                values |= p.literal(value.get<std::string>());
+                                values |= p.tool_arg_string_value(p.literal(value.get<std::string>())) + arg_close;
                             }
                             // ac() emits a delimiter-only grammar, which would discard these literals.
-                            arg_value = p.tool_arg_string_value(values) + arg_close;
+                            arg_value = values;
                         } else if (literal_schema && literal_schema->kind() == common_chat_schema::KIND_CONST) {
                             const auto & value = static_cast<const common_chat_schema_const *>(literal_schema)->value;
                             arg_value = p.tool_arg_string_value(p.literal(value.get<std::string>())) + arg_close;
