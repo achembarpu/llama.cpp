@@ -204,7 +204,8 @@ void ggml_cuda_mul_mat_q(
 
         int ntiles_J_best = INT_MAX;
 
-        for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+        const bool fixed_tiles = !ids && ggml_cuda_q4_0_batch_invariant(cc, src0->type);
+        for (int J = fixed_tiles ? 32 : 8; J <= (fixed_tiles ? 32 : 128) && ntiles_J_best > 1; J += 8) {
             const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, J, fallback, cc, prec_src1);
             if (config.type == GGML_TYPE_COUNT) {
                 continue;
