@@ -7952,6 +7952,62 @@ static void test_msg_diffs_compute() {
     }
 }
 
+static void test_qwen_string_literals() {
+    const std::vector<std::string> values = { "print(\"Cedar\")\nprint(\"C:\\\\logs\")", "Café", "" };
+    for (const auto & path : { "models/templates/Qwen3.5-4B.jinja", "models/templates/Qwen3-Coder.jinja" }) {
+        auto tmpls = read_templates(path);
+        for (int kind = 0; kind < 3; ++kind) {
+            json literal = kind == 0 ? json{ { "type", "string" }, { "enum", values } } :
+                                      json{ { "const", values[0] } };
+            json schema = { { "type", "object" }, { "properties", { { "command", literal } } },
+                            { "required", json::array({ "command" }) } };
+            if (kind == 2) {
+                schema["$defs"]["literal"] = literal;
+                schema["properties"]["command"] = { { "$ref", "#/$defs/literal" } };
+            }
+            common_chat_templates_inputs inputs;
+            inputs.messages = { message_user };
+            inputs.enable_thinking = false;
+            inputs.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+            inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+            inputs.tools = { { "echo_command", "Return the command", schema.dump() } };
+            auto parser = make_peg_parser(tmpls.get(), inputs);
+            const auto xml = [](const std::string & value) {
+                return "<tool_call>\n<function=echo_command>\n<parameter=command>\n" + value +
+                       "\n</parameter>\n</function>\n</tool_call>";
+            };
+            for (const auto & value : values) {
+                auto grammar = build_grammar(parser.params_.grammar);
+                assert_equals(kind == 0 || value == values[0],
+                    match_string(parser.params_.generation_prompt + xml(value), grammar.get()));
+                if (kind == 0 || value == values[0]) {
+                    auto message = parser.parse(xml(value), false);
+                    assert_equals(size_t(1), message.tool_calls.size());
+                    assert_equals(value, json::parse(message.tool_calls[0].arguments)["command"].get<std::string>());
+                    common_chat_msg previous;
+                    std::string arguments;
+                    const auto wire = xml(value);
+                    for (size_t n = 1; n <= wire.size(); ++n) {
+                        if (n < wire.size() && (static_cast<unsigned char>(wire[n]) & 0xc0) == 0x80) {
+                            continue;
+                        }
+                        auto partial = parser.parse(wire.substr(0, n), n != wire.size());
+                        for (const auto & diff : common_chat_msg_diff::compute_diffs(previous, partial)) {
+                            arguments += diff.tool_call_delta.arguments;
+                        }
+                        previous = std::move(partial);
+                    }
+                    assert_equals(value, json::parse(arguments)["command"].get<std::string>());
+                }
+            }
+            for (const auto & invalid : { "unlisted", "print(\"Cedar\")\nprint(\"C:\\logs\")" }) {
+                auto grammar = build_grammar(parser.params_.grammar);
+                assert_equals(false, match_string(parser.params_.generation_prompt + xml(invalid), grammar.get()));
+            }
+        }
+    }
+}
+
 int main(int argc, char ** argv) {
     bool detailed_debug    = false;
     bool only_run_filtered = false;
@@ -7972,6 +8028,10 @@ int main(int argc, char ** argv) {
             g_force_reconstruction_test = true;
             only_run_filtered          = true;
         }
+    }
+
+    if (g_template_filter.empty() || g_template_filter.find("Qwen") != std::string::npos) {
+        test_qwen_string_literals();
     }
 
     if (only_run_filtered) {

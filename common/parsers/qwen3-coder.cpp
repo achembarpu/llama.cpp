@@ -111,7 +111,25 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
                     if (!types.has(common_chat_schema::TYPE_STRING)) {
                         arg_value = p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", doc, *param.schema)) + arg_close;
                     } else if (types.is_only(common_chat_schema::TYPE_STRING)) {
-                        arg_value = arg_string;
+                        const common_chat_schema * literal_schema = param.schema.get();
+                        std::set<const common_chat_schema *> refs;
+                        while (literal_schema && literal_schema->kind() == common_chat_schema::KIND_REF &&
+                               refs.insert(literal_schema).second) {
+                            literal_schema = static_cast<const common_chat_schema_ref *>(literal_schema)->target;
+                        }
+                        if (literal_schema && literal_schema->kind() == common_chat_schema::KIND_ENUM) {
+                            auto values = p.choice();
+                            for (const auto & value : static_cast<const common_chat_schema_enum *>(literal_schema)->values) {
+                                values |= p.literal(value.get<std::string>());
+                            }
+                            // ac() emits a delimiter-only grammar, which would discard these literals.
+                            arg_value = p.tool_arg_string_value(values) + arg_close;
+                        } else if (literal_schema && literal_schema->kind() == common_chat_schema::KIND_CONST) {
+                            const auto & value = static_cast<const common_chat_schema_const *>(literal_schema)->value;
+                            arg_value = p.tool_arg_string_value(p.literal(value.get<std::string>())) + arg_close;
+                        } else {
+                            arg_value = arg_string;
+                        }
                     } else {
                         // The string alternative accepts any text, so the grammar only keeps the raw string
                         // rule. The parser still tries the JSON alternatives first to type the value.
