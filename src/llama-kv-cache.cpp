@@ -9,6 +9,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -1335,7 +1336,50 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
+static bool canonical_kv_rows_enabled() {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_CUDA_ATTN_BATCH_INVARIANT");
+        return value && atoi(value) != 0;
+    }();
+    return enabled;
+}
+
+struct canonical_kv_segment {
+    llama_seq_id seq_id;
+    llama_pos pos;
+    uint32_t offset;
+    uint32_t count;
+};
+
+static std::vector<canonical_kv_segment> canonical_kv_layout(
+        const llama_kv_cells & cells, const llama_ubatch & ubatch, uint32_t alignment) {
+    std::vector<llama_seq_id> owners(ubatch.seq_id_unq, ubatch.seq_id_unq + ubatch.n_seqs_unq);
+    std::sort(owners.begin(), owners.end());
+    std::vector<canonical_kv_segment> result;
+    uint64_t offset = 0;
+    for (const auto seq_id : owners) {
+        const int64_t first = cells.seq_pos_min(seq_id);
+        const int64_t last  = cells.seq_pos_max(seq_id);
+        if (first < 0 || last < first) {
+            return {};
+        }
+        const int64_t begin = first / alignment * alignment;
+        const uint64_t count = GGML_PAD(last + 1, alignment) - begin;
+        // Bound sparse position ranges and the row tensor independently of physical packing.
+        if (count > uint64_t(cells.size()) + 2 * alignment || offset + count > INT32_MAX) {
+            return {};
+        }
+        result.push_back({seq_id, (llama_pos) begin, (uint32_t) offset, (uint32_t) count});
+        offset += count;
+    }
+    return result;
+}
+
 uint32_t llama_kv_cache::get_n_kv_slices(const llama_ubatch & ubatch) {
+    // One union map also handles unequal prefill/decode batches. The mask selects each owner's segment.
+    if (canonical_kv_rows_enabled()) {
+        return 1;
+    }
     if (ubatch.n_seqs_unq == 1) {
         return 1;
     }
@@ -1365,6 +1409,14 @@ uint32_t llama_kv_cache::get_n_kv_rows(const llama_ubatch & ubatch, uint32_t n_k
     }
 
     const auto & cells = v_cells[0];
+
+    if (canonical_kv_rows_enabled()) {
+        if (model.arch != LLM_ARCH_GEMMA4 && model.arch != LLM_ARCH_GEMMA4_ASSISTANT) {
+            return 0;
+        }
+        const auto layout = canonical_kv_layout(cells, ubatch, n_swa ? 256 : 4096);
+        return layout.empty() ? 0 : layout.back().offset + layout.back().count;
+    }
 
     uint32_t n_max = 0;
     uint32_t n_sum = 0;
@@ -1662,6 +1714,7 @@ struct args_set_input_kq_mask {
 
     // cell of each mask column per stream, nullptr if the columns are the cells
     const int32_t * rows;
+    const std::pair<uint32_t, uint32_t> * row_bounds;
 };
 
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
@@ -1762,7 +1815,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 // cell of the column, negative for padding
                 const int32_t j = rows ? rows[c] : (int32_t) c;
 
-                if (j < 0 || cells.is_empty(j)) {
+                if ((args.row_bounds && (c < args.row_bounds[seq_id].first || c >= args.row_bounds[seq_id].second)) ||
+                        j < 0 || cells.is_empty(j)) {
                     goto skip;
                 }
 
@@ -1883,6 +1937,16 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 
     //const int64_t t_start = ggml_time_us();
 
+    std::vector<std::pair<uint32_t, uint32_t>> row_bounds;
+    if (kv_rows && canonical_kv_rows_enabled()) {
+        row_bounds.resize(LLAMA_MAX_SEQ);
+        const auto layout = canonical_kv_layout(v_cells[0], *ubatch, n_swa ? 256 : 4096);
+        GGML_ASSERT(!layout.empty() && layout.back().offset + layout.back().count == n_kv);
+        for (const auto & segment : layout) {
+            row_bounds[segment.seq_id] = {segment.offset, segment.offset + segment.count};
+        }
+    }
+
     const args_set_input_kq_mask args = {
         /*.hparams          =*/ hparams,
         /*.ubatch           =*/ ubatch,
@@ -1894,6 +1958,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
         /*.rows             =*/ kv_rows ? (const int32_t *) kv_rows->data : nullptr,
+        /*.row_bounds       =*/ row_bounds.empty() ? nullptr : row_bounds.data(),
     };
 
     if (kv_rows) {
@@ -1923,6 +1988,21 @@ void llama_kv_cache::set_input_kv_rows(ggml_tensor * dst, const llama_ubatch * u
     const auto & cells = v_cells[0];
 
     int32_t * data = (int32_t *) dst->data;
+
+    if (canonical_kv_rows_enabled()) {
+        GGML_ASSERT(n_slices == 1);
+        const auto layout = canonical_kv_layout(cells, *ubatch, n_swa ? 256 : 4096);
+        GGML_ASSERT(!layout.empty() && layout.back().offset + layout.back().count == n_rows);
+        std::fill(data, data + n_rows, -1);
+        for (const auto & segment : layout) {
+            for (const auto cell : cells.seq_cells(segment.seq_id)) {
+                const int64_t row = segment.offset + int64_t(cells.pos_get(cell)) - segment.pos;
+                GGML_ASSERT(row >= segment.offset && row < segment.offset + segment.count);
+                data[row] = cell;
+            }
+        }
+        return;
+    }
 
     for (int64_t s = 0; s < n_slices; ++s) {
         int32_t * rows = data + s*n_rows;
