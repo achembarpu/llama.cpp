@@ -220,7 +220,7 @@ public:
     // find a slot of kv cells that can hold the ubatch
     // if cont == true, then the slot must be continuous
     // return empty slot_info on failure
-    slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
+    slot_info find_slot(const llama_ubatch & ubatch, bool cont, const llama_pos * output_pos_min = nullptr) const;
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool do_purge = true);
