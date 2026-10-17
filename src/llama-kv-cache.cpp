@@ -769,6 +769,20 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
     llama_kv_cache::slot_info_vec_t res;
 
+    llama_pos output_pos_min[LLAMA_MAX_SEQ];
+    std::fill(output_pos_min, output_pos_min + LLAMA_MAX_SEQ, INT32_MAX);
+    for (const auto & ubatch : ubatches) {
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            if (!ubatch.output[i]) {
+                continue;
+            }
+            for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+                const auto seq = ubatch.seq_id[i][j];
+                output_pos_min[seq] = std::min(output_pos_min[seq], ubatch.pos[i]);
+            }
+        }
+    }
+
     struct state_t {
         slot_info sinfo; // slot info for the ubatch
 
@@ -784,7 +798,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
     for (const auto & ubatch : ubatches) {
         // only find a suitable slot for the ubatch. don't modify the cells yet
-        const auto sinfo_new = find_slot(ubatch, false);
+        const auto sinfo_new = find_slot(ubatch, false, output_pos_min);
         if (sinfo_new.empty()) {
             success = false;
             break;
@@ -913,7 +927,7 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     return updated;
 }
 
-llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {
+llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont, const llama_pos * output_pos_min) const {
 
     if (debug > 0) {
         for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
@@ -1071,8 +1085,12 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                     if (!can_use) {
                         const llama_seq_id seq_id_cell = cells.seq_get(idx);
 
-                        // SWA mask
-                        if (llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
+                        // Later microbatches must retain the history needed to replay rejected output tokens.
+                        llama_pos pos_next = cells.seq_pos_max(seq_id_cell) + 1;
+                        if (output_pos_min) {
+                            pos_next = std::min(pos_next, output_pos_min[seq_id_cell]);
+                        }
+                        if (llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, pos_next)) {
                             can_use = true;
                         }
                     }

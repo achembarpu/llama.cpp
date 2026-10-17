@@ -50,6 +50,7 @@ static bool check(int n_verify, bool fail) {
         if (i == 0) for (int pos = 6143; pos < 6143 + n_verify; ++pos) rows.emplace_back(1, pos);
         while (rows.size() < 128) rows.emplace_back(0, long_pos++);
         ubatches.push_back(batch(rows));
+        if (i == 0) for (int j = 0; j < n_verify; ++j) ubatches.back().data->output[j] = 1;
     }
     const auto first_slot = cache.find_slot(ubatches[0], false);
     if (fail) {
@@ -72,6 +73,18 @@ static bool check(int n_verify, bool fail) {
         exact = cache.seq_pos_min(1) <= 5120 && cache.seq_pos_max(1) == 6142 + n_verify;
         for (size_t i = 1; i < planned.size(); ++i) cache.apply_ubatch(planned[i], ubatches[i]);
         exact = exact && cache.seq_pos_max(1) == 6142 + n_verify;
+        const int replay_min = cache.seq_pos_min(1);
+        cache.seq_rm(1, 6144, -1);
+        std::vector<int> present(1024, 0);
+        const auto & replay = cache.get_cells(0);
+        for (uint32_t i = 0; i < replay.size(); ++i) {
+            if (!replay.seq_has(i, 1)) continue;
+            const int pos = replay.pos_get(i);
+            if (pos >= 5120 && pos < 6144) present[pos - 5120]++;
+        }
+        const bool replay_history = std::all_of(present.begin(), present.end(), [](int n) { return n == 1; });
+        std::printf("{\"verify\":%d,\"replay_min\":%d,\"replay_history\":%d}\n", n_verify, replay_min, replay_history);
+        exact = exact && replay_history;
     }
     return exact;
 }
