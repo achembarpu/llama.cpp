@@ -150,6 +150,11 @@ endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-save-load-state.cpp)
+llama_build(test-gemma-replay-shape.cpp)
+if (GGML_CUDA)
+    llama_build(test-mul-mat-batch-invariance.cpp)
+    llama_build(test-flash-attn-batch-invariance.cpp)
+endif()
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
