@@ -374,11 +374,11 @@ static void ggml_cuda_flash_attn_ext_mma_q_switch_ncols(ggml_backend_cuda_contex
     if (ggml_cuda_fattn_batch_invariant(cc, dst)) {
         if constexpr (D == 256) {
             GGML_ASSERT(ncols2 == 2);
-            ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 4, 2, type_KV>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 8, 2, type_KV>(ctx, dst);
             return;
         } else if constexpr (D == 512) {
             GGML_ASSERT(ncols2 == 8);
-            ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 4, 8, type_KV>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 8, 8, type_KV>(ctx, dst);
             return;
         }
     }
