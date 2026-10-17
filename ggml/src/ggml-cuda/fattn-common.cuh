@@ -50,7 +50,8 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+                            const int k_chunk_tiles);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -1130,7 +1131,9 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    const bool scan_mask = !use_sparse && mask && n_kv_cols % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
+    const int k_chunk_tiles = stream_k && ggml_cuda_fattn_batch_invariant(cc, KQV) ?
+        (Q->ne[0] == 256 ? 256 : 4096) / nbatch_fa : 0;
+    const bool scan_mask = !k_chunk_tiles && !use_sparse && mask && n_kv_cols % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
     if (scan_mask) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
@@ -1191,8 +1194,10 @@ void launch_fattn(
         blocks_num.y = 1;
         blocks_num.z = 1;
 
-        if (ggml_cuda_fattn_batch_invariant(cc, KQV)) {
-            blocks_num.x = ntiles_dst * std::min(8, ntiles_KV);
+        if (k_chunk_tiles) {
+            const int parts = (ntiles_KV + k_chunk_tiles - 1) / k_chunk_tiles;
+            GGML_ASSERT(int64_t(ntiles_dst) * parts <= INT_MAX);
+            blocks_num.x = ntiles_dst * parts;
         } else if (use_stream_k) {
             const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
             // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
@@ -1293,7 +1298,8 @@ void launch_fattn(
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        k_chunk_tiles
     );
     CUDA_CHECK(cudaGetLastError());
 
