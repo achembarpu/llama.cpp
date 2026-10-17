@@ -546,10 +546,14 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     const ggml_tensor * KQV = dst;
     const ggml_tensor * Q   = dst->src[0];
 
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
-    if (Q->ne[1] == 1) {
+    const bool fixed_quantized_vec_partition = GGML_CUDA_CC_IS_NVIDIA(cc) &&
+        cc >= GGML_CUDA_CC_AMPERE && (ggml_is_quantized(type_K) || ggml_is_quantized(type_V));
+    if (Q->ne[1] == 1 || fixed_quantized_vec_partition) {
         constexpr int cols_per_block = 1;
         if (logit_softcap == 0.0f) {
             constexpr bool use_logit_softcap = false;

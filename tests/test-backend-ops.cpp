@@ -8362,6 +8362,79 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// A speculative verification row must agree with scoring the same query alone.
+struct test_flash_attn_ext_batch_invariance : public test_flash_attn_ext {
+    const int64_t row;
+
+    test_flash_attn_ext_batch_invariance(ggml_type type, int64_t kv, int64_t nb, int64_t row)
+        : test_flash_attn_ext(256, 256, 4, {8, 1}, kv, nb, true, false, 0, 0,
+                              GGML_PREC_F32, type, type), row(row) {}
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",batch_invariance=1,row=" + std::to_string(row);
+    }
+
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 0; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        for (size_t i = 0; i < n; ++i) {
+            if (a[i] != 0.0f || b[i] != 0.0f) {
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * batched = test_flash_attn_ext::build_graph(ctx);
+        ggml_tensor * q = batched->src[0];
+        ggml_tensor * m = batched->src[3];
+        ggml_tensor * q_one = ggml_view_4d(ctx, q, q->ne[0], 1, q->ne[2], q->ne[3],
+                                         q->nb[1], q->nb[2], q->nb[3], row*q->nb[1]);
+        ggml_tensor * m_one = ggml_view_4d(ctx, m, m->ne[0], 1, 1, 1,
+                                         m->nb[1], m->nb[2], m->nb[3], row*m->nb[1]);
+        ggml_tensor * single = ggml_flash_attn_ext(ctx, q_one, batched->src[1], batched->src[2],
+                                                 m_one, 1.0f/sqrtf(hsk), 0, 0);
+        ggml_prec_set_acc(single, prec);
+        ggml_tensor * selected = ggml_view_4d(ctx, batched, batched->ne[0], batched->ne[1], 1, 1,
+                                            batched->nb[1], batched->nb[2], batched->nb[3],
+                                            row*batched->nb[2]);
+        return ggml_sub(ctx, single, selected);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        uint32_t seed = 0x43fd1234;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            const size_t n = ggml_nelements(t);
+            std::vector<float> data(n);
+            if (strcmp(t->name, "m") == 0) {
+                for (int64_t query = 0; query < nb; ++query) {
+                    for (int64_t key = 0; key < kv; ++key) {
+                        data[query*kv + key] = key <= kv - nb + query ? 0.0f : -INFINITY;
+                    }
+                }
+            } else {
+                for (float & value : data) {
+                    seed = seed*1664525u + 1013904223u;
+                    value = float(seed >> 8)/8388608.0f - 1.0f;
+                }
+            }
+            if (t->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_set(t, data.data(), 0, n*sizeof(float));
+            } else {
+                std::vector<uint8_t> quantized(ggml_nbytes(t));
+                ggml_quantize_chunk(t->type, data.data(), quantized.data(), 0,
+                                    ggml_nrows(t), t->ne[0], nullptr);
+                ggml_backend_tensor_set(t, quantized.data(), 0, quantized.size());
+            }
+        }
+    }
+};
+
 // large Q values, so the online softmax has to rescale the partial results
 struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     static constexpr int q_range = 20;
@@ -11639,6 +11712,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(128, 128,  8, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 10.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+        for (int64_t kv : {256, 4096, 4352, 16384, 65536}) {
+            for (int64_t nb : {2, 3, 4}) {
+                for (int64_t row : {int64_t(0), nb - 1}) {
+                    test_cases.emplace_back(new test_flash_attn_ext_batch_invariance(type, kv, nb, row));
+                }
+            }
+        }
+    }
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));

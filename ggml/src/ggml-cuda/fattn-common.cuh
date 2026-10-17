@@ -1189,15 +1189,22 @@ void launch_fattn(
             dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
         }
     } else {
-        // parallel_blocks must not be larger than what the tensor size allows:
-        parallel_blocks = std::min(parallel_blocks, ntiles_KV);
+        // Keep the reduction order stable across speculative batch widths.
+        const bool fixed_quantized_vec_partition = GGML_CUDA_CC_IS_NVIDIA(cc) &&
+            cc >= GGML_CUDA_CC_AMPERE && Q->ne[1] <= 4 &&
+            (ggml_is_quantized(K->type) || ggml_is_quantized(V->type)) && !need_f16_K && !need_f16_V;
+        if (!fixed_quantized_vec_partition) {
+            // parallel_blocks must not be larger than what the tensor size allows:
+            parallel_blocks = std::min(parallel_blocks, ntiles_KV);
+        }
 
         // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
         // Test whether parallel_blocks can be set to a higher value for better efficiency.
         const int blocks_per_wave = nsm * max_blocks_per_sm;
+        const int parallel_blocks_max = fixed_quantized_vec_partition ? parallel_blocks : ntiles_KV;
         int nwaves_best = 0;
         int efficiency_percent_best = 0;
-        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= parallel_blocks_max; ++parallel_blocks_test) {
             const int nblocks_total = ntiles_dst * parallel_blocks_test;
             const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
             const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
