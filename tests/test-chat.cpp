@@ -7953,12 +7953,13 @@ static void test_msg_diffs_compute() {
 }
 
 static void test_qwen_string_literals() {
-    const std::vector<std::string> values = { "print(\"Cedar\")\nprint(\"C:\\\\logs\")", "Café", "" };
+    const std::string constant = "print(\"Cedar\")\nprint(\"C:\\\\logs\")";
+    const std::vector<std::string> values = { "", constant, "prefix", "prefix-long", "Caf\xc3\xa9" };
     for (const auto & path : { "models/templates/Qwen3.5-4B.jinja", "models/templates/Qwen3-Coder.jinja" }) {
         auto tmpls = read_templates(path);
         for (int kind = 0; kind < 3; ++kind) {
             json literal = kind == 0 ? json{ { "type", "string" }, { "enum", values } } :
-                                      json{ { "const", values[0] } };
+                                      json{ { "const", constant } };
             json schema = { { "type", "object" }, { "properties", { { "command", literal } } },
                             { "required", json::array({ "command" }) } };
             if (kind == 2) {
@@ -7978,9 +7979,9 @@ static void test_qwen_string_literals() {
             };
             for (const auto & value : values) {
                 auto grammar = build_grammar(parser.params_.grammar);
-                assert_equals(kind == 0 || value == values[0],
+                assert_equals(kind == 0 || value == constant,
                     match_string(parser.params_.generation_prompt + xml(value), grammar.get()));
-                if (kind == 0 || value == values[0]) {
+                if (kind == 0 || value == constant) {
                     auto message = parser.parse(xml(value), false);
                     assert_equals(size_t(1), message.tool_calls.size());
                     assert_equals(value, json::parse(message.tool_calls[0].arguments)["command"].get<std::string>());
